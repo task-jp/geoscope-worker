@@ -1,0 +1,7 @@
+numpy>=1.26
+scipy>=1.12
+opencv-python-headless>=4.10
+Pillow>=10.0
+requests>=2.32
+# ML — AGPL-3.0
+ultralytics>=8.0
