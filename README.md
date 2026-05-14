@@ -14,7 +14,7 @@
 ## 関連リポジトリ
 
 - **GeoScope backend / frontend**: 別リポジトリで運用 (このリポジトリの worker と HTTP API 経由で通信)
-- **公開 Docker image**: `docker.io/tasukusuzukisignalslot/geoscope-worker:latest`
+- **公開 Docker image**: `ghcr.io/task-jp/geoscope-worker:latest`
 
 ## アーキテクチャ
 

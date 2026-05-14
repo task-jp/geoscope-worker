@@ -1,6 +1,6 @@
 # GeoScope クラウドワーカー Docker image (AGPL-3.0)
 # Built from this repository's source, distributed at:
-#   docker.io/tasukusuzukisignalslot/geoscope-worker:latest
+#   ghcr.io/task-jp/geoscope-worker:latest
 #
 # Source code: https://github.com/task-jp/geoscope-worker
 
