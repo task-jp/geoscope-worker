@@ -114,7 +114,11 @@ def _init_dem_from_archive() -> None:
 
     既に展開済み (marker file 存在 or タイル数が一定以上) ならスキップ。
     REMOTE_TILES=true かつ DEM_TILE_BASE_URL 設定時のみ動作。
+    SKIP_DEM_EXTRACT=true (永続 volume 無し設計) なら何もしない (per-tile fetch で動く)。
     """
+    if os.environ.get("SKIP_DEM_EXTRACT", "").lower() in ("1", "true", "yes"):
+        print("SKIP_DEM_EXTRACT set; DEM tiles will be fetched per-tile from R2")
+        return
     if not (REMOTE_TILES and DEM_TILE_BASE_URL):
         return
     tiles_root = Path(TILES_DIR)
