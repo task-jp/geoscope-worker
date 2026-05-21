@@ -1357,10 +1357,18 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
                 pass
 
     # タイル列挙してparallel configを設定（スタンドアロンワーカーが参加可能にする）
-    from app.services.scanning import _enumerate_tiles
-    all_tiles = _enumerate_tiles(TILES_DIR, None, fetch_tile if REMOTE_TILES else None)
     if combined_tile_set:
-        all_tiles = [(p, tx, ty) for p, tx, ty in all_tiles if (tx, ty) in combined_tile_set]
+        # 都道府県等で範囲が決まっている場合は集合から直接生成する。
+        # _enumerate_tiles はローカルファイル列挙にフォールバックする経路があり、
+        # SKIP_DEM_EXTRACT=true の Pod ではローカルにタイルがほぼ無いため
+        # 正しい範囲が得られない (2/2 tiles 空成功問題)。
+        all_tiles = [
+            (str(Path(TILES_DIR) / "16" / str(tx) / f"{ty}.webp"), tx, ty)
+            for tx, ty in combined_tile_set
+        ]
+    else:
+        from app.services.scanning import _enumerate_tiles
+        all_tiles = _enumerate_tiles(TILES_DIR, None, fetch_tile if REMOTE_TILES else None)
     total_tiles = len(all_tiles)
 
     # スキャン範囲のタイル全部 + 拡張タイル用隣接を prefetch (R2 並列で高速取得)
