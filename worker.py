@@ -310,6 +310,74 @@ def download_model(project_id: str, dest_path: str) -> bool:
                 raise
 
 
+def upload_multi_model(combined_hash: str, model_path: str, meta: dict | None = None):
+    """Upload a multi-class model (+ optional meta) to server keyed by combined_hash.
+
+    Pod ephemeral 環境 (RunPod BYO) で 2 回目以降のスキャンが学習を skip できるよう、
+    combined_hash 単位でモデルキャッシュをサーバ側に保持する。
+    """
+    import time as _time
+    for attempt in range(4):
+        try:
+            with open(model_path, "rb") as f:
+                files = {"file": ("best.pt", f)}
+                data = {"meta": json.dumps(meta)} if meta is not None else None
+                resp = requests.post(
+                    f"{SERVER_URL}/api/worker/models/multi/{combined_hash}/upload",
+                    headers=_headers(), files=files, data=data,
+                    timeout=180, verify=_VERIFY_SSL,
+                )
+            resp.raise_for_status()
+            print(f"  Multi model uploaded ({resp.json().get('size', 0)} bytes, hash={combined_hash})")
+            return resp.json()
+        except Exception as e:
+            if attempt < 3:
+                print(f"  Multi upload failed (attempt {attempt+1}): {e}, retrying...")
+                _time.sleep(5)
+            else:
+                raise
+
+
+def download_multi_model(combined_hash: str, dest_path: str) -> bool:
+    """Download a multi-class model from server by combined_hash. Returns True if found."""
+    import time as _time
+    for attempt in range(4):
+        try:
+            resp = requests.get(
+                f"{SERVER_URL}/api/worker/models/multi/{combined_hash}/download",
+                headers=_headers(), timeout=180, verify=_VERIFY_SSL,
+            )
+            if resp.status_code == 404:
+                return False
+            resp.raise_for_status()
+            Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest_path).write_bytes(resp.content)
+            print(f"  Multi model downloaded ({len(resp.content)} bytes, hash={combined_hash})")
+            return True
+        except Exception as e:
+            if attempt < 3:
+                print(f"  Multi download failed (attempt {attempt+1}): {e}, retrying...")
+                _time.sleep(5)
+            else:
+                raise
+
+
+def download_multi_meta(combined_hash: str) -> dict | None:
+    """Fetch meta.json (class_map / project_hashes) for a multi-class cached model."""
+    try:
+        resp = requests.get(
+            f"{SERVER_URL}/api/worker/models/multi/{combined_hash}/meta",
+            headers=_headers(), timeout=60, verify=_VERIFY_SSL,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"  Multi meta fetch failed: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Job lifecycle
 # ---------------------------------------------------------------------------
@@ -1128,11 +1196,41 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
     model_path = str(Path(model_dir) / "best.pt")
     class_map_file = Path(model_dir) / ".class_map.json"
 
-    # キャッシュチェック (exact match)
+    # キャッシュチェック (local exact match)
     if Path(model_path).exists() and class_map_file.exists():
         print(f"  Model cache hit ({combined_hash}), reusing")
         update_all(0.0, "モデル再利用（アノテーション変更なし）")
         return model_path
+
+    # サーバキャッシュチェック (combined_hash で一致するモデル)
+    # Pod ephemeral 環境 (RunPod BYO) でも 2 回目以降のスキャンが学習を skip できる。
+    server_meta = download_multi_meta(combined_hash)
+    if server_meta and "class_map" in server_meta:
+        if download_multi_model(combined_hash, model_path):
+            # サーバ側 class_map に合わせて現 class_map を再構築
+            # (model 内の cls_idx を維持しないと detection の振り分けが壊れる)
+            new_class_map: dict = {}
+            current_by_pid = {info["project_id"]: info for info in class_map.values()}
+            for old_idx_str, srv_info in server_meta["class_map"].items():
+                pid = srv_info.get("project_id")
+                cur = current_by_pid.get(pid)
+                if cur is not None:
+                    new_class_map[int(old_idx_str)] = cur
+            if len(new_class_map) == len(class_map):
+                class_map.clear()
+                class_map.update(new_class_map)
+                Path(model_dir).mkdir(parents=True, exist_ok=True)
+                class_map_file.write_text(
+                    json.dumps({str(k): v for k, v in class_map.items()})
+                )
+                # per-project hashes も書き戻し (次回ローカルキャッシュ判定で使用)
+                hash_file = Path(model_dir) / ".project_hashes.json"
+                hash_file.write_text(json.dumps(server_meta.get("project_hashes", {})))
+                print(f"  Server cache hit ({combined_hash}), downloaded model")
+                update_all(0.0, "モデル再利用（サーバーキャッシュ）")
+                return model_path
+            else:
+                print(f"  Server cache class_map mismatch (expected {len(class_map)} got {len(new_class_map)}), retraining")
 
     # スーパーセットモデル検索: 現在の全プロジェクトを含む既存モデルを探す
     needed = {pid: h for pid, h in per_project_hashes}  # {project_id: hash}
@@ -1244,6 +1342,16 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
                 break
     hash_file.write_text(json.dumps(hash_data))
     print(f"  Multi-class training complete ({combined_hash}, {nc} classes)")
+
+    # サーバキャッシュにも upload (次回 Pod から学習 skip するため)
+    try:
+        upload_multi_model(combined_hash, model_path, meta={
+            "class_map": {str(k): v for k, v in class_map.items()},
+            "project_hashes": hash_data,
+        })
+    except Exception as e:
+        print(f"  Multi cache upload failed (will retry on next scan): {e}")
+
     return model_path
 
 
