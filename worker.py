@@ -1371,21 +1371,39 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
             except JobAlreadyDone:
                 pass
 
-    # タイルセット: 全プロジェクトの和集合
+    # タイルセット: 全プロジェクトの和集合。prefecture=None (= 全国) のジョブが
+    # 1つでもあれば /tiles/list/16 を引いてサーバー実在の全 land タイル (約 107 万)
+    # を対象にする。以前は combined_tile_set=None でフォールバックし、結果的に
+    # ローカル cache 内のタイルしか走らない「偽物の全国」になっていた。
     update_all(0.30, "スキャン準備中...")
-    combined_tile_set = None
+    combined_tile_set: set[tuple[int, int]] = set()
+    needs_japan_all = False
     for info in class_map.values():
         pref = info["prefecture"]
         if not pref:
-            combined_tile_set = None
-            break
+            needs_japan_all = True
+            break  # 全国は都道府県の上位集合
         try:
             tiles_data = api_get(f"/api/prefectures/{requests.utils.quote(pref)}/tiles?z=16")
             if tiles_data:
-                pref_tiles = {(t["x"], t["y"]) for t in tiles_data}
-                combined_tile_set = pref_tiles if combined_tile_set is None else combined_tile_set | pref_tiles
+                combined_tile_set |= {(t["x"], t["y"]) for t in tiles_data}
         except Exception as e:
             print(f"  Failed to get tiles for {pref}: {e}")
+
+    if needs_japan_all:
+        try:
+            import struct as _struct
+            resp = requests.get(f"{SERVER_URL}/tiles/list/16",
+                                headers=_headers(), timeout=120, verify=_VERIFY_SSL)
+            resp.raise_for_status()
+            data = resp.content
+            combined_tile_set = {
+                _struct.unpack_from("<HH", data, i) for i in range(0, len(data), 4)
+            }
+            print(f"  全国 mode: {len(combined_tile_set):,} tiles from /tiles/list/16")
+        except Exception as e:
+            print(f"  Failed to get Japan-wide tile list: {e}")
+            combined_tile_set = set()  # 空 set: 下流で空チェックされ no-op
 
     min_conf = min(info["conf_threshold"] for info in class_map.values())
     upload_counts = defaultdict(int)
