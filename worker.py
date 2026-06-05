@@ -1410,6 +1410,30 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
             print(f"  Failed to get Japan-wide tile list: {e}")
             combined_tile_set = set()  # 空 set: 下流で空チェックされ no-op
 
+    # ─────────────────────────────────────────────────────────────
+    # 配布物ラベル ↔ 実スキャン範囲の乖離を fail-loud で潰す仕組み。
+    # 過去に「全国」UI で起動した scan が裏で教師近辺の数万件しか走らず、
+    # 月単位で気付かれずに biased な検出結果を蓄積していた。再発防止として、
+    # 名乗っている mode に対し最小タイル数を assert し、満たさなければ
+    # その場で job を fail させる。
+    # 数字の根拠: z=16 の日本本土 land タイルは約 107 万件 (CLAUDE.md / tiles.list)。
+    # ネット瞬断 / R2 ダウンで部分取得になっても 80 万切ったら確実に異常。
+    # ─────────────────────────────────────────────────────────────
+    SCAN_TILE_FLOOR_JAPAN = 800_000
+    n_target = len(combined_tile_set)
+    mode_label = "全国" if needs_japan_all else "+".join(
+        sorted({(info.get("prefecture") or "?") for info in class_map.values()})
+    )
+    floor = SCAN_TILE_FLOOR_JAPAN if needs_japan_all else 1
+    status = "OK" if n_target >= floor else "VIOLATION"
+    print(f"[scan-coverage] mode={mode_label} n_tiles={n_target:,} floor={floor:,} status={status}")
+    if status == "VIOLATION":
+        raise RuntimeError(
+            f"scan coverage violation: mode={mode_label} に対し対象タイルが "
+            f"{n_target:,} 件しかない (floor={floor:,})。fake-全国 縮退の "
+            f"再発と判断し、biased な結果を生む前にジョブを fail させます。"
+        )
+
     min_conf = min(info["conf_threshold"] for info in class_map.values())
     upload_counts = defaultdict(int)
 
