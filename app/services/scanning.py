@@ -468,23 +468,47 @@ def scan_tiles(
             dl_done = threading.Event()
 
             def _downloader():
-                # 拡張タイルに必要な隣接タイルも事前DL
-                needed = set()
-                for _, tx, ty, has_r, has_b, has_d in extended_tiles:
-                    needed.add((tx, ty))
-                    if has_r: needed.add((tx + 1, ty))
-                    if has_b: needed.add((tx, ty + 1))
-                    if has_d: needed.add((tx + 1, ty + 1))
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    def _fetch_one(coord):
-                        ttx, tty = coord
-                        local = Path(tiles_dir) / "16" / str(ttx) / f"{tty}.webp"
-                        if not local.exists():
-                            tile_fetcher(16, ttx, tty)
-                    list(executor.map(_fetch_one, needed, chunksize=16))
-                # DL完了後、拡張タイルをキューに投入
+                # 拡張タイルごとに必要な隣接タイルを束ね、依存が満たされた瞬間に
+                # dl_queue へ stream する。以前は全 needed タイルの fetch 完走を
+                # 同期で待ってから dl_queue に put していたため、cache hit の
+                # 多い 全国 scan でも consumer が数分〜数十分 starve していた。
+                pending: dict = {}        # et -> set of base coords still missing
+                waiters: dict = {}        # base coord -> list of et waiting
                 for et in extended_tiles:
-                    dl_queue.put(et)
+                    _, tx, ty, has_r, has_b, has_d = et
+                    et_deps = {(tx, ty)}
+                    if has_r: et_deps.add((tx + 1, ty))
+                    if has_b: et_deps.add((tx, ty + 1))
+                    if has_d: et_deps.add((tx + 1, ty + 1))
+                    pending[et] = et_deps
+                    for d in et_deps:
+                        waiters.setdefault(d, []).append(et)
+
+                needed = set(waiters.keys())
+                lock = threading.Lock()
+
+                def _fetch_one(coord):
+                    ttx, tty = coord
+                    local = Path(tiles_dir) / "16" / str(ttx) / f"{tty}.webp"
+                    if not local.exists():
+                        tile_fetcher(16, ttx, tty)
+                    # この coord に依存していた et のうち deps 全部揃ったものを取り出す
+                    released = []
+                    with lock:
+                        for et in waiters.pop(coord, ()):
+                            deps_remaining = pending.get(et)
+                            if deps_remaining is None:
+                                continue
+                            deps_remaining.discard(coord)
+                            if not deps_remaining:
+                                released.append(et)
+                                del pending[et]
+                    # lock 外で put (queue 満杯時にロック保持で他スレッドを止めない)
+                    for et in released:
+                        dl_queue.put(et)
+
+                with ThreadPoolExecutor(max_workers=32) as executor:
+                    list(executor.map(_fetch_one, needed, chunksize=16))
                 dl_done.set()
 
             dl_thread = threading.Thread(target=_downloader, daemon=True)
