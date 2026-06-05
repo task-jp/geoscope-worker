@@ -514,21 +514,28 @@ def scan_tiles(
             dl_thread = threading.Thread(target=_downloader, daemon=True)
             dl_thread.start()
 
-            batch = []
-            while True:
-                try:
-                    item = dl_queue.get(timeout=0.5)
-                    batch.append(item)
-                    if len(batch) >= 16:
-                        for r in pool.imap_unordered(_gen_3ch_extended, batch, chunksize=8):
-                            img_queue.put(r)
-                        batch.clear()
-                except queue.Empty:
-                    if dl_done.is_set() and dl_queue.empty():
-                        break
-            if batch:
-                for r in pool.imap_unordered(_gen_3ch_extended, batch, chunksize=8):
-                    img_queue.put(r)
+            # dl_queue から取れた拡張タイルを 1 件ずつ pool に流す。
+            # 旧コードは 16 件貯めてから chunksize=8 で imap_unordered していたため、
+            # 1 バッチで使われるワーカーは 2 個だけ、かつ 16 件全部の結果が戻るまで
+            # 次の dl_queue.get に進めず pool が休む時間が支配的になり、GPU 推論側
+            # (img_queue.get) が starve していた。連続供給に切り替えて 16 worker 全部を
+            # 常時飽和させる。
+            def _yield_extended():
+                while True:
+                    if _is_cancelled():
+                        return
+                    try:
+                        item = dl_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        if dl_done.is_set() and dl_queue.empty():
+                            return
+                        continue
+                    yield item
+
+            for r in pool.imap_unordered(_gen_3ch_extended, _yield_extended(), chunksize=1):
+                if _is_cancelled():
+                    break
+                img_queue.put(r)
             dl_thread.join()
         else:
             # Local tiles: 150%拡張タイル生成
