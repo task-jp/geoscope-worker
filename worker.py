@@ -756,10 +756,15 @@ def _post_annotations(project_id: str, annotations: list[dict], prefecture: str 
 
 # バックグラウンドアップロード用スレッドプール
 from concurrent.futures import ThreadPoolExecutor
-_upload_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="upload")
+_upload_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="upload")
 _upload_futures = []
 
-_MAX_PENDING_UPLOADS = 4  # これ以上溜まったら推論を待たせる
+# 検出密度が高い real-全国 では inline dedup (server 側で 数十万件への
+# ST_Intersects EXISTS) が 1 件あたり数百ms掛かる。max_workers=2 + 上限4
+# だと scan ループがすぐに upload 待ちで GPU を遊ばせるため、並列度を
+# 引き上げる。backend は uvicorn workers=4、DB プール 20+40 なので
+# 8 並列までは余裕。
+_MAX_PENDING_UPLOADS = 16  # これ以上溜まったら推論を待たせる
 
 def _post_annotations_async(project_id: str, annotations: list[dict], prefecture: str | None = None, scan_label: str | None = None):
     """Upload annotations in background thread. 溜まりすぎたらブロックして待つ。"""
