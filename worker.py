@@ -1521,16 +1521,14 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
                     pos_tiles.add((a["tile_x"], a["tile_y"]))
         if pos_tiles:
             import numpy as np
+            from scipy.spatial import cKDTree
             pos_arr = np.array(list(pos_tiles), dtype=np.int32)
             tile_coords = np.array([(tx, ty) for _, tx, ty in all_tiles], dtype=np.int32)
-            # 各タイルから最近接⭕タイルまでの距離²（チャンク処理でメモリ節約）
-            chunk_size = max(10000, 200_000_000 // max(len(pos_arr), 1))  # ~200MB上限
-            min_dists = np.empty(len(tile_coords), dtype=np.float32)
-            for i in range(0, len(tile_coords), chunk_size):
-                chunk = tile_coords[i:i+chunk_size]
-                dx = chunk[:, 0:1] - pos_arr[:, 0]  # (chunk, pos)
-                dy = chunk[:, 1:2] - pos_arr[:, 1]
-                min_dists[i:i+len(chunk)] = (dx * dx + dy * dy).min(axis=1)
+            # 各タイルから最近接⭕タイルまでの距離を k-d tree で一括計算。
+            # 旧コードは (chunk × pos) の int32 broadcasting を 17 チャンク回しており、
+            # py-spy で「Pre-fetch 完了後に 25 分以上 1533 行で張り付く」病的な
+            # スローダウンが実測された。cKDTree は 1.07M × 3k 程度なら秒未満で抜ける。
+            min_dists, _ = cKDTree(pos_arr).query(tile_coords)
             order = np.argsort(min_dists)
             all_tiles = [all_tiles[j] for j in order]
             print(f"  Total tiles: {total_tiles:,} (sorted by proximity to {len(pos_tiles)} ⭕ tiles)")
