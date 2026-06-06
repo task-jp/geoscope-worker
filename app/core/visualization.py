@@ -161,19 +161,50 @@ def compute_curvature(filled: np.ndarray, ksize: int = 31) -> np.ndarray:
     return np.clip(normalized, 0, 1)
 
 
+def _slope_aspect(filled: np.ndarray, cell_size: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+    """共有計算: np.gradient → slope, aspect を 1 度だけ作る。
+    dem_to_3ch から呼んで multi_hillshade / compute_slope 相当を再利用する。
+    値は標準関数 (multi_hillshade / compute_slope) と bit-同値。"""
+    dy, dx = np.gradient(filled, cell_size)
+    slope = np.arctan(np.sqrt(dx * dx + dy * dy))
+    aspect = np.arctan2(-dy, dx)
+    return slope, aspect
+
+
+def _hillshade_from(slope: np.ndarray, aspect: np.ndarray) -> np.ndarray:
+    """`multi_hillshade` と同じ値を、与えた slope/aspect で計算する。"""
+    alt = math.radians(45)
+    shades = []
+    for az_deg in [0, 90, 180, 270]:
+        az = math.radians(az_deg)
+        shade = np.clip(
+            math.sin(alt) * np.cos(slope)
+            + math.cos(alt) * np.sin(slope) * np.cos(az - aspect),
+            0,
+            1,
+        )
+        shades.append(shade)
+    return np.mean(shades, axis=0)
+
+
 def dem_to_3ch(elev: np.ndarray) -> np.ndarray:
     """DEM elevation → 3-channel uint8 image (H, W, 3).
 
     ch0: multi-direction hillshade
     ch1: slope
     ch2: curvature (Laplacian, convex=bright)
+
+    実装メモ: 標準関数 (multi_hillshade / compute_slope) は各々 np.gradient を
+    重複計算していた。768x768 では 1 度の gradient が ~10ms 効くので、
+    共有ヘルパー経由で 1 回に統合する。dtype・出力値は標準関数経由と完全同値。
     """
     filled = elev.copy()
     mean_val = np.nanmean(elev) if not np.isnan(elev).all() else 0
     filled[np.isnan(filled)] = mean_val
 
-    ch0 = multi_hillshade(filled)
-    ch1 = compute_slope(filled)
+    slope, aspect = _slope_aspect(filled)
+    ch0 = _hillshade_from(slope, aspect)
+    ch1 = np.clip(slope / (math.pi / 4), 0, 1)   # = compute_slope(filled)
     ch2 = compute_curvature(filled)
 
     img = np.stack([ch0, ch1, ch2], axis=2)
