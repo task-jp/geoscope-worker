@@ -179,24 +179,42 @@ def fetch_tile(z: int, x: int, y: int, session: requests.Session | None = None) 
     Returns the local path, or None if unavailable.
 
     session 指定時はそれを再利用 (HTTP keep-alive で並列 prefetch 高速化)。
+
+    Negative cache: 全 origin が 404 を返したタイルは同位置に `.404` 空ファイルを
+    置き、次回以降の fetch は HTTP を打たずに即 None を返す。R2 上に実在しない
+    陸縁タイル等は scan ごとに数十秒〜数分の retry を消費していたため。
+    ネットワーク/タイムアウト系のエラーは marker を作らない (= 後で復旧時に
+    再 fetch されるよう「不在の確信」と区別する)。
     """
     local = Path(TILES_DIR) / str(z) / str(x) / f"{y}.webp"
     if local.exists():
         return str(local)
+    miss_marker = local.with_suffix(".404")
+    if miss_marker.exists():
+        return None
     if not REMOTE_TILES:
         return None
     s = session or requests
+    all_origins_404 = True
     for url in _tile_urls(z, x, y):
         try:
             resp = s.get(url, timeout=15, verify=_VERIFY_SSL)
             if resp.status_code == 404:
                 continue
+            all_origins_404 = False
             resp.raise_for_status()
             local.parent.mkdir(parents=True, exist_ok=True)
             local.write_bytes(resp.content)
             return str(local)
         except Exception:
+            all_origins_404 = False
             continue
+    if all_origins_404:
+        try:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            miss_marker.touch()
+        except Exception:
+            pass
     return None
 
 
