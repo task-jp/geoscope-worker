@@ -4,6 +4,7 @@ Called by the GPU worker. Mirrors the pipeline structure of scan_all_yolo.py:
 multiprocess 3ch generation + GPU batch inference.
 """
 
+import functools
 import math
 import time
 import multiprocessing as _mp
@@ -68,8 +69,17 @@ def _gen_3ch(args: tuple) -> tuple | None:
         return None
 
 
+@functools.lru_cache(maxsize=128)
 def _load_dem_raw(tile_path: str) -> np.ndarray | None:
-    """Load DEM tile as elevation array without 3ch conversion."""
+    """Load DEM tile as elevation array without 3ch conversion.
+
+    LRU cache: 各 forkserver worker process 内で memoize する。
+    `_gen_3ch_extended` は隣接タイル (右 / 下 / 右下) を併せて 4 枚読むため、
+    proximity-sort で並んだスキャン中は同じ DEM タイルが直近で再 decode
+    される。cache hit で WebP decode + float64 cast の重複を消す。
+    呼び出し側 (`_gen_3ch_extended` 内 `canvas[...] = main` 等) は配列を
+    mutate していないので cache 共有 (= 同一 ndarray 返却) で安全。
+    """
     try:
         data = Path(tile_path).read_bytes()
         arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
