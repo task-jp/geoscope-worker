@@ -1609,7 +1609,7 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
             tiles_dir=TILES_DIR,
             conf_threshold=min_conf,
             batch_size=128,
-            num_workers=16,
+            num_workers=32,
             progress_callback=on_progress,
             detection_callback=on_detections,
             tile_fetcher=fetch_tile if REMOTE_TILES else None,
@@ -1805,7 +1805,7 @@ def handle_rescore(job: dict):
             tiles_dir=TILES_DIR,
             conf_threshold=0.01,  # 低閾値で全検出
             batch_size=128,
-            num_workers=16,
+            num_workers=32,
             tile_set=tile_set,
             progress_callback=_rescore_progress,
             cancel_event=_cancel_event,
