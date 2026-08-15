@@ -1291,6 +1291,12 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
     update_all(0.06, f"学習開始... ({nc}クラス)")
     from ultralytics import YOLO
     _new_job_found = False
+    # 学習フェーズを抜けたら進捗を送らせない。
+    # コールバックは model オブジェクトに残るので、train() から戻った後に発火すると
+    # 「学習中... (epoch N/100)」がスキャンの進捗を上書きしてしまう。
+    # スキャン序盤のタイル prefetch は RunPod だと数十分かかることがあり、
+    # その間ずっと学習中の表示と学習時の progress 値に巻き戻って見える。
+    _training_active = True
 
     def _on_epoch_end(trainer):
         nonlocal _new_job_found
@@ -1298,6 +1304,9 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
         if _shutdown_requested:
             trainer.stop = True
             print(f"  Shutdown requested — stopping training early")
+            return
+
+        if not _training_active:
             return
 
         # ハートビート: 学習中にprogress更新を送り、stale job auto-failを防ぐ
@@ -1323,6 +1332,8 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
         patience=20, augment=True, degrees=360, flipud=0.5, fliplr=0.5,
         scale=0.3, mosaic=0.5, exist_ok=True, verbose=False,
     )
+    # ここから先はスキャンフェーズ。コールバックが後から発火しても進捗を送らせない
+    _training_active = False
 
     if _new_job_found:
         return "new_job_found"
