@@ -1207,11 +1207,20 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
     新ジョブが見つかった場合は 'new_job_found' を返す。"""
     import hashlib
 
+    # キャンセルを握り潰すと学習が止まらない。100エポックの学習は数十分〜1時間以上
+    # かかるので、その間 UI からキャンセルしても効かず後続ジョブが待たされる。
+    # スキャン側は _cancel_event で抜けるが、学習側は trainer.stop で止めるため
+    # フラグを立てて次のエポック終了時に反応させる。
+    _cancelled = False
+
     def update_all(progress, message):
+        nonlocal _cancelled
         for jid in job_ids:
             try:
                 update_progress(jid, progress, message)
-            except (JobCancelled, JobAlreadyDone):
+            except JobCancelled:
+                _cancelled = True
+            except JobAlreadyDone:
                 pass
 
     combined_hash = hashlib.sha256(str(sorted(per_project_hashes)).encode()).hexdigest()[:16]
@@ -1316,6 +1325,11 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
         pct = 0.06 + (epoch / total) * 0.44
         update_all(pct, f"学習中... (epoch {epoch}/{total})")
 
+        if _cancelled:
+            trainer.stop = True
+            print(f"  Job cancelled — stopping training early")
+            return
+
         if _new_job_found:
             return
         if _peek_queued_scan():
@@ -1334,6 +1348,38 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
     )
     # ここから先はスキャンフェーズ。コールバックが後から発火しても進捗を送らせない
     _training_active = False
+
+    # 学習の DataLoader を明示的に解放する。
+    # cache=True で全データセットをメモリに載せた worker プロセスが、学習後も
+    # trainer から参照されて生き残る。2026-08-17 に 24 プロセスが 338GB を抱えたまま
+    # 18 時間残り、物理 251GB に対し要求 433GB でスワップが枯渇。後続スキャンの
+    # 3ch 生成が常時ページイン待ちになり、速度が 19 分の 1 (94→5 tile/s) に落ちた。
+    # GC 任せでは trainer への参照が切れず回収されないので、ここで断ち切る。
+    try:
+        tr = getattr(model, "trainer", None)
+        if tr is not None:
+            for attr in ("train_loader", "test_loader"):
+                dl = getattr(tr, attr, None)
+                if dl is not None:
+                    it = getattr(dl, "_iterator", None)
+                    if it is not None:
+                        it._shutdown_workers()
+                    setattr(tr, attr, None)
+            for attr in ("trainset", "testset"):
+                if hasattr(tr, attr):
+                    setattr(tr, attr, None)
+    except Exception as e:
+        print(f"  DataLoader 解放に失敗 (続行): {e}")
+    import gc as _gc
+    _gc.collect()
+    import torch as _torch
+    if _torch.cuda.is_available():
+        _torch.cuda.empty_cache()
+
+    if _cancelled:
+        # 中断した学習結果でスキャンに進んでも意味がない。
+        # 呼び出し元 (handle_scan_jobs) が JobCancelled を捕まえて次のジョブへ移る
+        raise JobCancelled("Job cancelled during training")
 
     if _new_job_found:
         return "new_job_found"
@@ -1507,7 +1553,14 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
             for jid in info["job_ids"]:
                 try:
                     update_progress(jid, progress, det_msg)
-                except (JobCancelled, JobAlreadyDone):
+                except JobCancelled:
+                    # キャンセルを握り潰すとスキャンが止まらない。
+                    # 全国スキャンは数時間かかるので、その間 UI からキャンセルしても
+                    # 効かず、後続のジョブがキューで待たされ続ける
+                    # (2026-08-16 に実際に発生し、ワーカーの再起動が必要になった)。
+                    # _cancel_event は run_scan に渡してあるので set すれば抜ける。
+                    _cancel_event.set()
+                except JobAlreadyDone:
                     pass
 
     def on_detections(dets: list[dict]):
