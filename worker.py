@@ -519,6 +519,51 @@ def _coco_to_yolo(coco_dir: str, yolo_dir: str):
     )
 
 
+def _release_training_memory(model) -> None:
+    """学習が抱えたメモリを解放する。model.train() のあとに必ず呼ぶこと。
+
+    cache=True でデータセットを丸ごとメモリに載せた DataLoader worker が、
+    学習後も trainer から参照されて生き残る。GC 任せでは参照が切れず回収されない。
+
+    2026-08-17 の実害: worker 24 プロセスが合計 338GB を抱えたまま 18 時間残り、
+    物理 251GB に対し要求 433GB でスワップが枯渇。後続の全国スキャンで 3ch 生成が
+    常時ページイン待ちになり、速度が 94 tile/s → 5 tile/s (19分の1) に落ちた。
+    完了見込みが 4 時間から 34 時間に伸びた。
+
+    学習とスキャンが同一プロセスで連続するので、ここを漏らすと後段が巻き添えになる。
+    train() が例外を投げた場合も解放したいので、呼び出し側は try/finally で囲むこと。
+    """
+    try:
+        tr = getattr(model, "trainer", None)
+        if tr is None:
+            return
+        for attr in ("train_loader", "test_loader"):
+            dl = getattr(tr, attr, None)
+            if dl is None:
+                continue
+            it = getattr(dl, "_iterator", None)
+            if it is not None:
+                try:
+                    it._shutdown_workers()
+                except Exception:
+                    pass
+            setattr(tr, attr, None)
+        for attr in ("trainset", "testset"):
+            if hasattr(tr, attr):
+                setattr(tr, attr, None)
+    except Exception as e:
+        print(f"  DataLoader 解放に失敗 (続行): {e}")
+    finally:
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def train_yolo(yolo_dir: str, model_dir: str, epochs: int = 100,
                batch_size: int = 16, progress_callback=None) -> dict:
     """Train YOLO model using ultralytics."""
@@ -527,22 +572,25 @@ def train_yolo(yolo_dir: str, model_dir: str, epochs: int = 100,
     model = YOLO("yolo26n.pt")
     data_yaml = str(Path(yolo_dir) / "data.yaml")
 
-    results = model.train(
-        data=data_yaml,
-        epochs=epochs,
-        imgsz=512,
-        batch=batch_size,
-        device=0,
-        patience=20,
-        augment=True,
-        degrees=360,
-        flipud=0.5,
-        fliplr=0.5,
-        scale=0.3,
-        mosaic=0.5,
-        exist_ok=True,
-        verbose=False,
-    )
+    try:
+        results = model.train(
+            data=data_yaml,
+            epochs=epochs,
+            imgsz=512,
+            batch=batch_size,
+            device=0,
+            patience=20,
+            augment=True,
+            degrees=360,
+            flipud=0.5,
+            fliplr=0.5,
+            scale=0.3,
+            mosaic=0.5,
+            exist_ok=True,
+            verbose=False,
+        )
+    finally:
+        _release_training_memory(model)
 
     save_dir = Path(results.save_dir)
     best_path = save_dir / "weights" / "best.pt"
@@ -881,13 +929,16 @@ def _train_if_needed(job_id: str, project_id: str, config: dict) -> str | None:
         if _shutdown_requested:
             trainer.stop = True
     model.add_callback("on_train_epoch_end", _abort_on_shutdown)
-    results = model.train(
-        data=str(Path(yolo_dir) / "data.yaml"),
-        epochs=config.get("epochs", 100),
-        imgsz=512, batch=config.get("batch_size", 16), device=0,
-        patience=20, augment=True, degrees=360, flipud=0.5, fliplr=0.5,
-        scale=0.3, mosaic=0.5, exist_ok=True, verbose=False,
-    )
+    try:
+        results = model.train(
+            data=str(Path(yolo_dir) / "data.yaml"),
+            epochs=config.get("epochs", 100),
+            imgsz=512, batch=config.get("batch_size", 16), device=0,
+            patience=20, augment=True, degrees=360, flipud=0.5, fliplr=0.5,
+            scale=0.3, mosaic=0.5, exist_ok=True, verbose=False,
+        )
+    finally:
+        _release_training_memory(model)
     save_dir = Path(results.save_dir)
     best = save_dir / "weights" / "best.pt"
     if not best.exists():
@@ -1340,41 +1391,19 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
     model = YOLO("yolo26n.pt")
     model.add_callback("on_train_epoch_end", _on_epoch_end)
 
-    results = model.train(
-        data=str(Path(yolo_dir) / "data.yaml"),
-        epochs=100, imgsz=512, batch=-1, device=0, cache=True,
-        patience=20, augment=True, degrees=360, flipud=0.5, fliplr=0.5,
-        scale=0.3, mosaic=0.5, exist_ok=True, verbose=False,
-    )
+    try:
+        results = model.train(
+            data=str(Path(yolo_dir) / "data.yaml"),
+            epochs=100, imgsz=512, batch=-1, device=0, cache=True,
+            patience=20, augment=True, degrees=360, flipud=0.5, fliplr=0.5,
+            scale=0.3, mosaic=0.5, exist_ok=True, verbose=False,
+        )
+    finally:
+        # 学習が落ちても解放する。残すと後続スキャンがスワップで潰れる
+        _release_training_memory(model)
+
     # ここから先はスキャンフェーズ。コールバックが後から発火しても進捗を送らせない
     _training_active = False
-
-    # 学習の DataLoader を明示的に解放する。
-    # cache=True で全データセットをメモリに載せた worker プロセスが、学習後も
-    # trainer から参照されて生き残る。2026-08-17 に 24 プロセスが 338GB を抱えたまま
-    # 18 時間残り、物理 251GB に対し要求 433GB でスワップが枯渇。後続スキャンの
-    # 3ch 生成が常時ページイン待ちになり、速度が 19 分の 1 (94→5 tile/s) に落ちた。
-    # GC 任せでは trainer への参照が切れず回収されないので、ここで断ち切る。
-    try:
-        tr = getattr(model, "trainer", None)
-        if tr is not None:
-            for attr in ("train_loader", "test_loader"):
-                dl = getattr(tr, attr, None)
-                if dl is not None:
-                    it = getattr(dl, "_iterator", None)
-                    if it is not None:
-                        it._shutdown_workers()
-                    setattr(tr, attr, None)
-            for attr in ("trainset", "testset"):
-                if hasattr(tr, attr):
-                    setattr(tr, attr, None)
-    except Exception as e:
-        print(f"  DataLoader 解放に失敗 (続行): {e}")
-    import gc as _gc
-    _gc.collect()
-    import torch as _torch
-    if _torch.cuda.is_available():
-        _torch.cuda.empty_cache()
 
     if _cancelled:
         # 中断した学習結果でスキャンに進んでも意味がない。
@@ -1843,12 +1872,15 @@ def handle_rescore(job: dict):
             if _shutdown_requested:
                 trainer.stop = True
         model.add_callback("on_train_epoch_end", _abort_on_shutdown)
-        results = model.train(
-            data=str(Path(yolo_dir) / "data.yaml"),
-            epochs=100, imgsz=512, batch=-1, device=0, cache=True,
-            patience=20, augment=True, degrees=360, flipud=0.5, fliplr=0.5,
-            scale=0.3, mosaic=0.5, exist_ok=True, verbose=False,
-        )
+        try:
+            results = model.train(
+                data=str(Path(yolo_dir) / "data.yaml"),
+                epochs=100, imgsz=512, batch=-1, device=0, cache=True,
+                patience=20, augment=True, degrees=360, flipud=0.5, fliplr=0.5,
+                scale=0.3, mosaic=0.5, exist_ok=True, verbose=False,
+            )
+        finally:
+            _release_training_memory(model)
         save_dir = Path(results.save_dir)
         best = save_dir / "weights" / "best.pt"
         if not best.exists():
