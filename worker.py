@@ -556,7 +556,11 @@ def _release_training_memory(model) -> None:
                 except Exception:
                     pass
             setattr(tr, attr, None)
-        for attr in ("trainset", "testset"):
+        # DataLoader を止めてもデータセット実体は trainer から参照され続ける。
+        # cache=True では画像を丸ごとメモリに持つのでここが本体。
+        # ema / optimizer / scaler もモデル複製や状態を抱えるので一緒に落とす。
+        # model 本体は呼び出し側が best.pt を読み直すので保持不要。
+        for attr in ("trainset", "testset", "data", "ema", "optimizer", "scaler"):
             if hasattr(tr, attr):
                 setattr(tr, attr, None)
     except Exception as e:
