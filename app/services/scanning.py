@@ -6,6 +6,7 @@ multiprocess 3ch generation + GPU batch inference.
 
 import functools
 import math
+import os
 import time
 import multiprocessing as _mp
 from pathlib import Path
@@ -89,7 +90,11 @@ def _load_dem_raw(tile_path: str) -> np.ndarray | None:
         g = arr[:, :, 1].astype(np.float64)
         b = arr[:, :, 0].astype(np.float64)
         x = r * 65536 + g * 256 + b
-        elev = np.where(x == 2**23, np.nan, np.where(x > 2**24, (x - 2**24) * 0.01, x * 0.01))
+        # 符号付き 24bit。x は 24bit なので `x > 2**24` は絶対に成立せず、
+        # 以前はここが 2**24 だったため負の標高が 167,772m の突起になっていた。
+        # 曲率の正規化は全画面の std/mean を使うので、1 画素の突起で 768x768 の
+        # 全画素が狂う。app/core/dem.py:decode_dem と同じ式にすること。
+        elev = np.where(x == 2**23, np.nan, np.where(x > 2**23, (x - 2**24) * 0.01, x * 0.01))
         return elev
     except Exception:
         return None
@@ -98,11 +103,163 @@ def _load_dem_raw(tile_path: str) -> np.ndarray | None:
 EXTENDED_PX = TILE_PX + TILE_PX // 2  # 768 = 512 + 256
 
 
+CACHE_3CH_DIR = os.environ.get("CACHE_3CH_DIR", "")
+
+# 3ch の生成方法を変えたら必ず上げる。上げると旧世代は参照されなくなる。
+#
+# 無効化を元 DEM の mtime 比較だけに頼ると、コードを変えても DEM は変わらないので
+# 古い画像を黙って再利用してしまう。実際に v1 でそれを踏んだ:
+# v1 は隣接タイルをスキャン対象集合で絞っており、都道府県スキャンの縁で
+# 学習側と違う画像を作っていた (一致率 40%)。
+#   v1: 隣接を tile_coord_set で絞る (破棄)
+#   v2: 隣接はファイル存在で判定。ただし DEM デコードの符号バグを抱えたまま (破棄)
+#   v3: _load_dem_raw の符号付き 24bit を修正 (学習側 decode_dem と一致)
+_CACHE_3CH_VERSION = "v3"
+
+
+def _cache_base(tx: int) -> Path:
+    return Path(CACHE_3CH_DIR) / _CACHE_3CH_VERSION / "16" / str(tx)
+
+
+def _cache_3ch_read(tx: int, ty: int, src_paths: list[str]) -> tuple | None | str:
+    """3ch キャッシュを引く。戻り値は 3 通り:
+      ndarray      : キャッシュヒット (そのまま使える)
+      "skip"       : 生成対象外と判定済み (前回 None を返したタイル)
+      None         : キャッシュなし / 無効 → 生成する
+
+    無効化は mtime 比較で行う。DEM は再変換で中身が変わることがあり
+    (docs/DEM_PIPELINE.md の fill / refresh)、古い 3ch を返すと
+    「更新したのに結果が変わらない」という最悪の不具合になる。
+    stat 4 回は生成 308ms に対して無視できるコスト。
+    """
+    base = _cache_base(tx)
+    img_p, skip_p = base / f"{ty}.webp", base / f"{ty}.skip"
+    try:
+        newest_src = max(os.stat(p).st_mtime for p in src_paths if os.path.exists(p))
+    except ValueError:
+        return None
+    for p, kind in ((img_p, "img"), (skip_p, "skip")):
+        try:
+            if os.stat(p).st_mtime < newest_src:
+                continue  # DEM の方が新しい → 作り直す
+        except OSError:
+            continue
+        if kind == "skip":
+            return "skip"
+        arr = cv2.imdecode(np.fromfile(p, np.uint8), cv2.IMREAD_COLOR)
+        if arr is not None and arr.shape == (EXTENDED_PX, EXTENDED_PX, 3):
+            return arr
+    return None
+
+
+_ENC_POOL = None
+_ENC_PENDING: list = []
+
+
+def _enc_submit(fn, *a) -> None:
+    """符号化を背景スレッドに投げる。
+
+    可逆 WebP の符号化は 254ms かかり、3ch 生成 (308ms) と直列にすると
+    初回スキャンが約 1.8 倍に伸びる。プールワーカーは 32 個で 64 コアの半分しか
+    使っていないため、符号化を別スレッドに出せば空きコアで処理され、初回も
+    現状と同じ速度で終わる (OpenCV は GIL を解放するので Python でも並列に効く)。
+
+    未完了が溜まると 1 件 1.7MB の画像を抱えたままメモリが膨らむので、
+    2 件を超えたら最古の完了を待つ (背圧)。
+    """
+    global _ENC_POOL
+    if _ENC_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        import atexit
+        _ENC_POOL = ThreadPoolExecutor(max_workers=1)
+        # maxtasksperchild でワーカーが作り直される際に書きかけを捨てない
+        atexit.register(lambda: _ENC_POOL.shutdown(wait=True))
+    _ENC_PENDING[:] = [f for f in _ENC_PENDING if not f.done()]
+    while len(_ENC_PENDING) >= 2:
+        _ENC_PENDING.pop(0).result()
+        _ENC_PENDING[:] = [f for f in _ENC_PENDING if not f.done()]
+    _ENC_PENDING.append(_ENC_POOL.submit(fn, *a))
+
+
+def _cache_3ch_write_sync(tx: int, ty: int, img: np.ndarray | None) -> None:
+    """3ch キャッシュを実際に書く (背景スレッドから呼ばれる)。
+    img=None なら "生成対象外" マーカーを置く。
+
+    可逆 WebP (quality 101) を使う。非可逆にすると学習時と推論時でピクセル値が
+    変わり、モデルにとって別画像になる。実測で q80 は正例の再現率を
+    52.8% → 49.5% に落とした (docs/CLAIMS.md 参照)。
+    可逆の往復がビット完全一致することは実測で確認済み。
+
+    32 プロセスが並行して書くので temp + os.replace で原子的に置換する。
+    中断で切れたファイルが残ると、次回それを decode して壊れた画像で推論してしまう。
+    """
+    base = _cache_base(tx)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        final = base / (f"{ty}.skip" if img is None else f"{ty}.webp")
+        tmp = base / f"{ty}.{os.getpid()}.tmp"
+        if img is None:
+            tmp.touch()
+        else:
+            ok, buf = cv2.imencode(".webp", img, [cv2.IMWRITE_WEBP_QUALITY, 101])
+            if not ok:
+                return
+            tmp.write_bytes(buf.tobytes())
+        os.replace(tmp, final)
+    except Exception:
+        pass  # キャッシュは最適化なので、書けなくてもスキャンは続ける
+
+
+def _cache_3ch_write(tx: int, ty: int, img: np.ndarray | None) -> None:
+    """3ch キャッシュの書き込みを背景スレッドに委ねる。"""
+    try:
+        _enc_submit(_cache_3ch_write_sync, tx, ty, img)
+    except Exception:
+        _cache_3ch_write_sync(tx, ty, img)
+
+
 def _gen_3ch_extended(args: tuple) -> tuple | None:
     """Generate 150% extended 3ch image (768×768) from tile (tx,ty).
     Covers full tile + 256px right + 256px down + 256×256 diagonal.
-    args: (tiles_dir, tx, ty, has_right, has_below, has_diag)."""
-    tiles_dir, tx, ty, has_right, has_below, has_diag = args
+    args: (tiles_dir, tx, ty).
+
+    CACHE_3CH_DIR が設定されていれば生成結果を可逆 WebP で保存し、
+    次回以降は decode (1.7ms) だけで済ませる。3ch は静的な DEM の純粋関数なので
+    スキャンごとに作り直す必要がない。実測で生成 308ms → 復号 1.7ms、
+    全国スキャンの律速が CPU から GPU に移り 100 → 243 tile/s になる。
+    既定は無効 (120 万枚で約 790GB 使うため、明示的に有効化させる)。
+    """
+    if not CACHE_3CH_DIR:
+        return _gen_3ch_uncached(args)
+
+    tiles_dir, tx, ty = args
+    src = [str(Path(tiles_dir) / "16" / str(x) / f"{y}.webp")
+           for x, y in ((tx, ty), (tx + 1, ty), (tx, ty + 1), (tx + 1, ty + 1))]
+
+    cached = _cache_3ch_read(tx, ty, src)
+    if isinstance(cached, str):          # "skip" = 前回 None だったタイル
+        return None
+    if cached is not None:
+        return (cached, tx, ty)
+
+    out = _gen_3ch_uncached(args)
+    # None も記録する。有効ピクセル 30% 未満や平坦なタイルは全体の一定割合を占め、
+    # 記録しないとそのぶんは毎回 308ms を払い続けることになる。
+    _cache_3ch_write(tx, ty, out[0] if out is not None else None)
+    return out
+
+
+def _gen_3ch_uncached(args: tuple) -> tuple | None:
+    """3ch 拡張タイルを DEM から実際に生成する (キャッシュを見ない)。
+
+    隣接タイルは「存在すれば貼る」。以前はスキャン対象集合 (tile_coord_set) に
+    入っているかで判定していたため、都道府県スキャンの縁では隣接 DEM が手元に
+    あっても貼られず、学習側 (dataset.py の _load_3ch_extended は存在判定) と
+    違う画像で推論していた。NaN 埋めが nanmean、曲率の正規化が全画面の std/mean
+    なので、貼るか貼らないかで 768x768 の全画素が変わる (実測 一致率 40%)。
+    3ch は DEM の関数であるべきで、スキャン範囲で変わってはいけない。
+    """
+    tiles_dir, tx, ty = args
     half = TILE_PX // 2  # 256
 
     canvas = np.full((EXTENDED_PX, EXTENDED_PX), np.nan)
@@ -120,25 +277,19 @@ def _gen_3ch_extended(args: tuple) -> tuple | None:
     canvas[:TILE_PX, :TILE_PX] = main
 
     # 右タイル (512:768, 0:512) — 左半分の256列
-    if has_right:
-        path_r = str(Path(tiles_dir) / "16" / str(tx + 1) / f"{ty}.webp")
-        right = _load_dem_raw(path_r)
-        if right is not None:
-            canvas[:TILE_PX, TILE_PX:] = right[:, :half]
+    right = _load_dem_raw(str(Path(tiles_dir) / "16" / str(tx + 1) / f"{ty}.webp"))
+    if right is not None:
+        canvas[:TILE_PX, TILE_PX:] = right[:, :half]
 
     # 下タイル (0:512, 512:768) — 上半分の256行
-    if has_below:
-        path_b = str(Path(tiles_dir) / "16" / str(tx) / f"{ty + 1}.webp")
-        below = _load_dem_raw(path_b)
-        if below is not None:
-            canvas[TILE_PX:, :TILE_PX] = below[:half, :]
+    below = _load_dem_raw(str(Path(tiles_dir) / "16" / str(tx) / f"{ty + 1}.webp"))
+    if below is not None:
+        canvas[TILE_PX:, :TILE_PX] = below[:half, :]
 
     # 右下タイル (512:768, 512:768) — 左上256×256
-    if has_diag:
-        path_d = str(Path(tiles_dir) / "16" / str(tx + 1) / f"{ty + 1}.webp")
-        diag = _load_dem_raw(path_d)
-        if diag is not None:
-            canvas[TILE_PX:, TILE_PX:] = diag[:half, :half]
+    diag = _load_dem_raw(str(Path(tiles_dir) / "16" / str(tx + 1) / f"{ty + 1}.webp"))
+    if diag is not None:
+        canvas[TILE_PX:, TILE_PX:] = diag[:half, :half]
 
     # NaN埋め
     valid = canvas[~np.isnan(canvas)]
@@ -438,13 +589,9 @@ def scan_tiles(
         return []
 
     # 150%拡張タイル: 各タイルを768×768に拡張（右+256, 下+256, 右下+256×256）
-    tile_coord_set = {(tx, ty) for _, tx, ty in tiles}
-    extended_tiles = []
-    for _, tx, ty in tiles:
-        has_right = (tx + 1, ty) in tile_coord_set
-        has_below = (tx, ty + 1) in tile_coord_set
-        has_diag = (tx + 1, ty + 1) in tile_coord_set
-        extended_tiles.append((tiles_dir, tx, ty, has_right, has_below, has_diag))
+    # 隣接タイルはスキャン対象集合に入っているかで絞らない。絞ると都道府県
+    # スキャンの縁で学習側と違う画像になる (_gen_3ch_uncached の docstring 参照)。
+    extended_tiles = [(tiles_dir, tx, ty) for _, tx, ty in tiles]
 
     total_tiles = len(extended_tiles)
 
@@ -485,11 +632,11 @@ def scan_tiles(
                 pending: dict = {}        # et -> set of base coords still missing
                 waiters: dict = {}        # base coord -> list of et waiting
                 for et in extended_tiles:
-                    _, tx, ty, has_r, has_b, has_d = et
-                    et_deps = {(tx, ty)}
-                    if has_r: et_deps.add((tx + 1, ty))
-                    if has_b: et_deps.add((tx, ty + 1))
-                    if has_d: et_deps.add((tx + 1, ty + 1))
+                    _, tx, ty = et
+                    # 隣接も必ず取る。取らないと 3ch が学習側と食い違う
+                    # (_gen_3ch_uncached の docstring 参照)。存在しない座標は
+                    # fetch_tile が .404 マーカーに記録するので 2 回目以降は無料。
+                    et_deps = {(tx, ty), (tx + 1, ty), (tx, ty + 1), (tx + 1, ty + 1)}
                     pending[et] = et_deps
                     for d in et_deps:
                         waiters.setdefault(d, []).append(et)
