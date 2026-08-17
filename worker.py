@@ -541,9 +541,17 @@ def _release_training_memory(model) -> None:
             dl = getattr(tr, attr, None)
             if dl is None:
                 continue
-            it = getattr(dl, "_iterator", None)
+            # ultralytics の InfiniteDataLoader は worker を使い回すため、
+            # 生成時に作ったイテレータを self.iterator に持ち続ける
+            # (PyTorch 標準の _iterator ではない。名前を間違えると何も起きない)。
+            # __del__ に正しい終了処理があるが、trainer → train_loader の参照が
+            # 生きている限り参照カウントが 0 にならず発火しない。だから明示的に呼ぶ。
+            it = getattr(dl, "iterator", None)
             if it is not None:
                 try:
+                    for w in getattr(it, "_workers", []):
+                        if w.is_alive():
+                            w.terminate()
                     it._shutdown_workers()
                 except Exception:
                     pass
