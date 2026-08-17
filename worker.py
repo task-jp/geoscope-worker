@@ -165,6 +165,12 @@ def _init_dem_from_archive() -> None:
         print(f"DEM archive extracted ({elapsed:.0f}s)")
 
 
+# タイル配信元が Cloudflare の bot 対策の後ろにいる場合、クライアントライブラリの既定 UA は
+# 403 で弾かれることがある (Python-urllib は実際に弾かれる)。名乗る主体を明示して、
+# 「どのライブラリの既定 UA が今たまたま許可されているか」に依存しないようにする。
+_TILE_HEADERS = {"User-Agent": "geoscope-worker (+https://github.com/task-jp/geoscope-worker)"}
+
+
 def _tile_urls(z: int, x: int, y: int) -> list[str]:
     """DEM タイル取得URL候補. R2 優先、なければ GeoScope サーバー fallback."""
     urls = []
@@ -198,7 +204,7 @@ def fetch_tile(z: int, x: int, y: int, session: requests.Session | None = None) 
     all_origins_404 = True
     for url in _tile_urls(z, x, y):
         try:
-            resp = s.get(url, timeout=15, verify=_VERIFY_SSL)
+            resp = s.get(url, timeout=15, verify=_VERIFY_SSL, headers=_TILE_HEADERS)
             if resp.status_code == 404:
                 continue
             all_origins_404 = False
