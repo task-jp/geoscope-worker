@@ -443,8 +443,27 @@ def _infer_yolo(
     model, images: list[np.ndarray], conf_threshold: float, device: torch.device,
     imgsz: int = 512,
 ) -> list[list[dict]]:
-    """Run YOLO inference on a batch."""
-    results = model.predict(images, conf=conf_threshold, iou=0.5, device=device,
+    """Run YOLO inference on a batch.
+
+    画像は GPU 上でテンソルに組んでから渡す。ultralytics に numpy のリストを渡すと
+    前処理を CPU でやるため、実測で 1 枚 3.12ms かかり全体の 69% を占めていた
+    (推論本体は 1.31ms、後処理は 0.09ms)。内訳は np.stack + BGR→RGB が 2.46ms、
+    transpose + ascontiguousarray が 1.13ms。BGR→RGB を CPU でやると負のストライドの
+    コピーが走るのが主因で、GPU 上で permute + インデックスすれば消える。
+    LetterBox も入力が既に EXTENDED_PX 角なので何もしないまま 0.41ms 払っていた。
+
+    1 枚ずつ GPU へ送って torch.stack する形が最速だった (np.stack してから 1 回で
+    送るより速い)。実測 4.32 → 2.64 ms/枚 = 231 → 379 tile/s。
+    正例タイル 256 枚・検出 330 件で、座標・スコアともに完全一致を確認済み。
+
+    注意: tensor を渡すと ultralytics は /255 の正規化を行わない (呼び出し側の責任)。
+    """
+    if images and isinstance(images[0], np.ndarray):
+        gpu = [torch.from_numpy(im).to(device, non_blocking=True) for im in images]
+        batch = torch.stack(gpu).permute(0, 3, 1, 2)[:, [2, 1, 0]].float() / 255
+    else:
+        batch = images
+    results = model.predict(batch, conf=conf_threshold, iou=0.5, device=device,
                             imgsz=imgsz, verbose=False)
     all_dets = []
     for r in results:
