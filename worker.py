@@ -1350,8 +1350,8 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
         class_map.update(new_class_map)
         return sup_path
 
-    nc = len(project_annotations)
-    update_all(0.02, f"Dataset生成中... ({nc}クラス)")
+    n_proj = len(project_annotations)
+    update_all(0.02, f"Dataset生成中... ({n_proj}プロジェクト)")
     # 全プロジェクトのアノテーションのタイルを事前 fetch (REMOTE_TILES=true 時のみ)
     for _pid, annots in project_annotations:
         _prefetch_annotation_tiles(annots)
@@ -1361,12 +1361,14 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
     total_pos = sum(ds_info["positive"].values())
     if total_pos == 0:
         return None
-    update_all(0.05, f"Dataset: {total_pos} positives, {nc} classes")
+    # 実クラス数は ⭕ の n_proj に ❌ の除外クラス n_proj を足した数 (dataset.py 参照)
+    n_cls = len(ds_info.get("class_names", [])) or n_proj
+    update_all(0.05, f"Dataset: {total_pos} positives, {n_cls} classes")
 
     yolo_dir = str(Path(dataset_dir) / "yolo")
     _coco_to_yolo(dataset_dir, yolo_dir)
 
-    update_all(0.06, f"学習開始... ({nc}クラス)")
+    update_all(0.06, f"学習開始... ({n_cls}クラス)")
     from ultralytics import YOLO
     _new_job_found = False
     # 学習フェーズを抜けたら進捗を送らせない。
@@ -1468,7 +1470,7 @@ def _train_multi(class_map, project_annotations, per_project_hashes, job_ids) ->
                 hash_data[str(cls_idx)] = {"project_id": pid, "hash": p_hash}
                 break
     hash_file.write_text(json.dumps(hash_data))
-    print(f"  Multi-class training complete ({combined_hash}, {nc} classes)")
+    print(f"  Multi-class training complete ({combined_hash}, {n_cls} classes)")
 
     # サーバキャッシュにも upload (次回 Pod から学習 skip するため)
     try:

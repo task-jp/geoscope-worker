@@ -331,12 +331,29 @@ def generate_multi_dataset(
     neg_tiles: set[tuple[int, int, int]] = set()
     pos_counts = {}
 
+    # ⭕ のクラスを先に全部並べ、その後ろに ❌ の除外クラスを並べる。
+    # ❌ を「bbox のない背景画像」として与えていた頃は、48px の対象を含む 512px の
+    # タイル 1 枚が背景になるだけで、対象は画像面積の 0.9%。勾配が全アンカーに薄く
+    # 分散し、⭕ が持つ「ここにこれがある」という鋭さが ❌ 側に無かった。
+    # 実測で ❌ 2,431 件のうち 154 件 (6.3%) が同一対象として再検出されていた
+    # (20m でも 50m でも件数が変わらない = 近傍の別物ではない)。
+    # 除外クラスにすると ❌ にも bbox 付きの教師データが与えられ、⭕ と同じ強さで
+    # 学習される。推論側は class_map に無いクラスを捨てるので (worker.py の
+    # on_detections)、除外クラスの検出はそのまま落ちる。
+    n_proj = len(project_annotations)
     for cls_idx, (project_id, annotations) in enumerate(project_annotations):
-        cat_id = cls_idx + 1
         class_names.append(project_id)
-        categories.append({"id": cat_id, "name": project_id, "supercategory": "none"})
+        categories.append({"id": cls_idx + 1, "name": project_id, "supercategory": "none"})
+    for cls_idx, (project_id, _) in enumerate(project_annotations):
+        neg_idx = n_proj + cls_idx
+        class_names.append(f"{project_id}__negative")
+        categories.append({"id": neg_idx + 1, "name": f"{project_id}__negative",
+                           "supercategory": "none"})
 
-        pos = 0
+    neg_counts = {}
+    for cls_idx, (project_id, annotations) in enumerate(project_annotations):
+        neg_idx = n_proj + cls_idx
+        pos = neg = 0
         for a in annotations:
             vote = a.get("annotation_vote")
             if not vote:
@@ -346,8 +363,15 @@ def generate_multi_dataset(
                 tile_pos[key][cls_idx].append(a)
                 pos += 1
             elif vote == "no":
-                neg_tiles.add(key)
+                # bbox を持つものは除外クラスの教師データにする。
+                # 持たない (古い import 等) ものは従来どおり背景タイル扱い。
+                if a.get("bbox_px_w") and a.get("bbox_px_h"):
+                    tile_pos[key][neg_idx].append(a)
+                    neg += 1
+                else:
+                    neg_tiles.add(key)
         pos_counts[project_id] = pos
+        neg_counts[project_id] = neg
 
     # Generate images (one per tile, multiple classes' bboxes)
     coco_images = []
@@ -432,5 +456,8 @@ def generate_multi_dataset(
         "train_images": len(train_coco["images"]),
         "val_images": len(val_coco["images"]),
         "positive": pos_counts,
-        "negative": len(neg_tiles - set(tile_pos.keys())),
+        # negative: bbox 付きで除外クラスの教師データにした件数 (プロジェクト別)
+        # negative_bg: bbox が無く従来どおり背景タイルにした枚数
+        "negative": neg_counts,
+        "negative_bg": len(neg_tiles - set(tile_pos.keys())),
     }
