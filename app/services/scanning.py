@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from app.core.dem import TILE_PX, decode_dem, pixel_to_latlon
-from app.core.visualization import dem_to_3ch
+from app.core.visualization import cell_size_m, dem_to_3ch
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +62,8 @@ def _gen_3ch(args: tuple) -> tuple | None:
         valid = elev[~np.isnan(elev)]
         if len(valid) < TILE_PX * TILE_PX * 0.3:
             return None
-        img = dem_to_3ch(elev)
+        lat, _ = pixel_to_latlon(16, tx, ty, TILE_PX / 2, TILE_PX / 2)
+        img = dem_to_3ch(elev, cell_size_m(lat, 16))
         if min(img[:, :, c].std() for c in range(3)) < 3:
             return None
         return (img, tx, ty)
@@ -114,7 +115,9 @@ CACHE_3CH_DIR = os.environ.get("CACHE_3CH_DIR", "")
 #   v1: 隣接を tile_coord_set で絞る (破棄)
 #   v2: 隣接はファイル存在で判定。ただし DEM デコードの符号バグを抱えたまま (破棄)
 #   v3: _load_dem_raw の符号付き 24bit を修正 (学習側 decode_dem と一致)
-_CACHE_3CH_VERSION = "v3"
+#   v4: cell_size を緯度から計算するようにした (以前は 1.0 固定で、大阪付近でのみ
+#       正しく、札幌で +14.7% / 稚内で +19.2% 傾斜を過小評価していた)
+_CACHE_3CH_VERSION = "v4"
 
 
 def _cache_base(tx: int) -> Path:
@@ -298,7 +301,8 @@ def _gen_3ch_uncached(args: tuple) -> tuple | None:
     canvas[np.isnan(canvas)] = np.nanmean(canvas) if len(valid) > 0 else 0
 
     try:
-        img = dem_to_3ch(canvas)
+        lat, _ = pixel_to_latlon(16, tx, ty, EXTENDED_PX / 2, EXTENDED_PX / 2)
+        img = dem_to_3ch(canvas, cell_size_m(lat, 16))
         if min(img[:, :, c].std() for c in range(3)) < 3:
             return None
         return (img, tx, ty)

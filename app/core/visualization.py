@@ -187,12 +187,35 @@ def _hillshade_from(slope: np.ndarray, aspect: np.ndarray) -> np.ndarray:
     return np.mean(shades, axis=0)
 
 
-def dem_to_3ch(elev: np.ndarray) -> np.ndarray:
+# 曲率の平滑化を「何メートルの範囲で行うか」。以前は ksize=31 画素固定で、
+# z=16 では約 31m だったが、他のズームでは物理的な意味が変わっていた。
+CURVATURE_SMOOTH_M = 31.0
+
+
+def cell_size_m(lat: float, z: int, tile_px: int = 512) -> float:
+    """1 画素が表す実距離 [m]。Web Mercator なので緯度に依存する。
+
+    以前は `cell_size=1.0` 固定だった。これは z=16 の大阪付近 (0.983 m/px) で
+    だけ正しく、実測で以下のずれがあった:
+        沖縄 1.072 m/px (-6.7%) / 大阪 0.983 (+1.7%) / 札幌 0.872 (+14.7%)
+        稚内 0.839 m/px (+19.2%) / z=15 では 1.966 m/px (-49.1%)
+    傾斜は `np.gradient(filled, cell_size)` で求めるので、この値が違うと
+    同じ地形が緯度・ズームによって別の見た目になる。傾斜チャンネルは
+    45° で飽和するため、z=15 では飽和画素が 1% → 17% に増えることを実測した。
+    """
+    return 156543.03392 * math.cos(math.radians(lat)) / (2 ** z) / (tile_px / 256)
+
+
+def dem_to_3ch(elev: np.ndarray, cell_size: float = 1.0) -> np.ndarray:
     """DEM elevation → 3-channel uint8 image (H, W, 3).
 
     ch0: multi-direction hillshade
     ch1: slope
     ch2: curvature (Laplacian, convex=bright)
+
+    cell_size は 1 画素の実距離 [m]。`cell_size_m(lat, z)` で求めて渡すこと。
+    既定の 1.0 は z=16 の大阪付近の近似値で、他の緯度・ズームでは傾斜が
+    誤って計算される (関数の docstring 参照)。
 
     実装メモ: 標準関数 (multi_hillshade / compute_slope) は各々 np.gradient を
     重複計算していた。768x768 では 1 度の gradient が ~10ms 効くので、
@@ -202,10 +225,12 @@ def dem_to_3ch(elev: np.ndarray) -> np.ndarray:
     mean_val = np.nanmean(elev) if not np.isnan(elev).all() else 0
     filled[np.isnan(filled)] = mean_val
 
-    slope, aspect = _slope_aspect(filled)
+    slope, aspect = _slope_aspect(filled, cell_size)
     ch0 = _hillshade_from(slope, aspect)
     ch1 = np.clip(slope / (math.pi / 4), 0, 1)   # = compute_slope(filled)
-    ch2 = compute_curvature(filled)
+    # 平滑化は物理スケールで揃える。ksize は奇数でなければならない。
+    ksize = max(3, int(round(CURVATURE_SMOOTH_M / cell_size)) | 1)
+    ch2 = compute_curvature(filled, ksize=ksize)
 
     img = np.stack([ch0, ch1, ch2], axis=2)
     return (img * 255).astype(np.uint8)

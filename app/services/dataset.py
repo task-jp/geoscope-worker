@@ -12,8 +12,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app.core.dem import TILE_PX, decode_dem
-from app.core.visualization import dem_to_3ch
+from app.core.dem import TILE_PX, decode_dem, pixel_to_latlon
+from app.core.visualization import cell_size_m, dem_to_3ch
 
 
 def _tile_path(tiles_dir: str, z: int, tx: int, ty: int) -> Path:
@@ -30,7 +30,8 @@ def _load_3ch(tiles_dir: str, z: int, tx: int, ty: int) -> np.ndarray | None:
         valid = elev[~np.isnan(elev)]
         if len(valid) < TILE_PX * TILE_PX * 0.3:
             return None
-        return dem_to_3ch(elev)
+        lat, _ = pixel_to_latlon(z, tx, ty, TILE_PX / 2, TILE_PX / 2)
+        return dem_to_3ch(elev, cell_size_m(lat, z))
     except Exception:
         return None
 
@@ -82,7 +83,9 @@ def _load_3ch_extended(tiles_dir: str, z: int, tx: int, ty: int) -> np.ndarray |
         return None
     canvas[np.isnan(canvas)] = np.nanmean(canvas) if len(valid) > 0 else 0
     try:
-        return dem_to_3ch(canvas)
+        # 学習と推論で cell_size を揃えないと 3ch が食い違う (scanning.py と同じ式)
+        lat, _ = pixel_to_latlon(z, tx, ty, EXTENDED_PX / 2, EXTENDED_PX / 2)
+        return dem_to_3ch(canvas, cell_size_m(lat, z))
     except Exception:
         return None
 
@@ -121,7 +124,7 @@ def _bbox_px_to_coco(cx: float, cy: float, w: float, h: float) -> tuple[float, f
 
 def _make_crop_entry(img, annots, ox, oy, images_dir, z, tx, ty, suffix,
                      image_id, annot_id, coco_images, coco_annotations,
-                     cat_id=1, cls_annots_map=None):
+                     cat_id=1, cls_annots_map=None, emitted=None):
     """Generate one 512×512 crop and its COCO annotations.
 
     If cls_annots_map is provided (multi-class), annots is ignored and
@@ -146,8 +149,18 @@ def _make_crop_entry(img, annots, ox, oy, images_dir, z, tx, ty, suffix,
         cx = a["bbox_px_cx"] - norm_ox
         cy = a["bbox_px_cy"] - norm_oy
         w, h = a["bbox_px_w"], a["bbox_px_h"]
-        if cx < 0 or cx > 1.0 or cy < 0 or cy > 1.0:
+        # bbox 全体がこの切り出しの内側にあるときだけ書き出す。
+        # 中心だけで判定していた頃は、端にかかる対象が `_bbox_px_to_coco` の
+        # max(0,...) で黙ってクリップされ、半分の形のまま「これが古墳だ」と
+        # 学習されていた。モデルはその切れた形を覚え、完全な形には反応しなくなる
+        # (実測: 指摘された 8 件のうち 4 件は隣タイルで conf 0.05 でも検出されず)。
+        # 拡張タイルと `_needs_shift` のシフト切り出しは、境界をまたぐ対象が
+        # どれかの切り出しに完全に収まるようにするための仕組みなので、
+        # 「完全に収まる切り出しにだけ書く」が本来の意図。
+        if cx - w / 2 < 0 or cx + w / 2 > 1.0 or cy - h / 2 < 0 or cy + h / 2 > 1.0:
             continue
+        if emitted is not None:
+            emitted.add(id(a))
         bbox = _bbox_px_to_coco(cx, cy, w, h)
         area = bbox[2] * bbox[3]
         if area < 1:
@@ -350,7 +363,39 @@ def generate_multi_dataset(
         categories.append({"id": neg_idx + 1, "name": f"{project_id}__negative",
                            "supercategory": "none"})
 
+    def _place(a: dict, tiles_dir: str) -> tuple[tuple[int, int, int], dict] | None:
+        """アノテーションを「完全な形で写るタイル」に割り当てる。
+
+        拡張タイルは右下にしか伸びないので、bbox が左/上にはみ出す対象は自タイルの
+        画像では切れている。`_bbox_px_to_coco` が max(0,...) で黙ってクリップするため、
+        半分の形のまま「これが古墳だ」と学習されていた (実測 ⭕ 631 件中 77 件 = 12.2%)。
+        モデルはその切れた形を覚え、完全な形には反応しなくなる — 実際に、指摘された
+        8 件のうち 4 件は隣タイルで conf を 0.05 まで下げても検出されなかった。
+
+        対象は左/上隣タイルの拡張画像には完全に写っているので、そちらの座標系
+        (cx += 1.0) で登録する。すると `_needs_shift` が右/下シフトを発火させ、
+        ox=256 の切り出しに bbox 全体が収まる。既存の仕組みで完結する。
+
+        隣タイルの DEM が無ければ完全な形を作れないので None を返す (学習に入れない)。
+        """
+        cx, cy = a["bbox_px_cx"], a["bbox_px_cy"]
+        w, h = a["bbox_px_w"], a["bbox_px_h"]
+        z, tx, ty = a["tile_z"], a["tile_x"], a["tile_y"]
+        dx = 1 if cx - w / 2 < 0 else 0
+        dy = 1 if cy - h / 2 < 0 else 0
+        if not dx and not dy:
+            return (z, tx, ty), a
+        ntx, nty = tx - dx, ty - dy
+        if not _tile_path(tiles_dir, z, ntx, nty).exists():
+            return None
+        shifted = dict(a)
+        shifted["bbox_px_cx"] = cx + dx
+        shifted["bbox_px_cy"] = cy + dy
+        shifted["tile_x"], shifted["tile_y"] = ntx, nty
+        return (z, ntx, nty), shifted
+
     neg_counts = {}
+    moved = dropped = 0
     for cls_idx, (project_id, annotations) in enumerate(project_annotations):
         neg_idx = n_proj + cls_idx
         pos = neg = 0
@@ -358,21 +403,27 @@ def generate_multi_dataset(
             vote = a.get("annotation_vote")
             if not vote:
                 continue
-            key = (a["tile_z"], a["tile_x"], a["tile_y"])
+            if vote == "no" and not (a.get("bbox_px_w") and a.get("bbox_px_h")):
+                # bbox を持たない ❌ (古い import 等) は従来どおり背景タイル扱い
+                neg_tiles.add((a["tile_z"], a["tile_x"], a["tile_y"]))
+                continue
+            placed = _place(a, tiles_dir)
+            if placed is None:
+                dropped += 1
+                continue
+            key, ann = placed
+            if (key[1], key[2]) != (a["tile_x"], a["tile_y"]):
+                moved += 1
             if vote == "yes":
-                tile_pos[key][cls_idx].append(a)
+                tile_pos[key][cls_idx].append(ann)
                 pos += 1
             elif vote == "no":
-                # bbox を持つものは除外クラスの教師データにする。
-                # 持たない (古い import 等) ものは従来どおり背景タイル扱い。
-                if a.get("bbox_px_w") and a.get("bbox_px_h"):
-                    tile_pos[key][neg_idx].append(a)
-                    neg += 1
-                else:
-                    neg_tiles.add(key)
+                tile_pos[key][neg_idx].append(ann)
+                neg += 1
         pos_counts[project_id] = pos
         neg_counts[project_id] = neg
 
+    emitted: set = set()
     # Generate images (one per tile, multiple classes' bboxes)
     coco_images = []
     coco_annotations = []
@@ -393,7 +444,7 @@ def generate_multi_dataset(
         image_id, annot_id = _make_crop_entry(
             img, [], 0, 0, images_dir, z, tx, ty, "",
             image_id, annot_id, coco_images, coco_annotations,
-            cls_annots_map=cls_annots)
+            cls_annots_map=cls_annots, emitted=emitted)
 
         # Shifted crops for boundary-crossing annotations
         if is_extended:
@@ -403,17 +454,17 @@ def generate_multi_dataset(
                 image_id, annot_id = _make_crop_entry(
                     img, [], HALF, 0, images_dir, z, tx, ty, "_r",
                     image_id, annot_id, coco_images, coco_annotations,
-                    cls_annots_map=cls_annots)
+                    cls_annots_map=cls_annots, emitted=emitted)
             if shift_down:
                 image_id, annot_id = _make_crop_entry(
                     img, [], 0, HALF, images_dir, z, tx, ty, "_d",
                     image_id, annot_id, coco_images, coco_annotations,
-                    cls_annots_map=cls_annots)
+                    cls_annots_map=cls_annots, emitted=emitted)
             if shift_right and shift_down:
                 image_id, annot_id = _make_crop_entry(
                     img, [], HALF, HALF, images_dir, z, tx, ty, "_rd",
                     image_id, annot_id, coco_images, coco_annotations,
-                    cls_annots_map=cls_annots)
+                    cls_annots_map=cls_annots, emitted=emitted)
 
     # Negative samples
     for z, tx, ty in neg_tiles:
@@ -460,4 +511,12 @@ def generate_multi_dataset(
         # negative_bg: bbox が無く従来どおり背景タイルにした枚数
         "negative": neg_counts,
         "negative_bg": len(neg_tiles - set(tile_pos.keys())),
+        # moved: 左/上にはみ出すため隣タイルの座標系に移して完全な形で学習させた件数
+        # dropped: 隣タイルの DEM が無く完全な形を作れなかったため学習に入れなかった件数
+        "moved_to_neighbor": moved,
+        "dropped_no_neighbor": dropped,
+        # どの切り出しにも完全には収まらず、学習に入らなかった件数。
+        # 512 の切り出しに対して大きすぎる対象 (幅 400px 超など) が該当する。
+        "not_emitted": sum(len(v) for d in tile_pos.values() for v in d.values())
+                       - len(emitted),
     }
