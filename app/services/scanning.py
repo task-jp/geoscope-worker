@@ -18,6 +18,7 @@ import torch
 
 from app.core.dem import TILE_PX, decode_dem, pixel_to_latlon
 from app.core.visualization import cell_size_m, dem_to_3ch
+from app.services.detections import EXTENDED_PX, resolve_detection
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +102,7 @@ def _load_dem_raw(tile_path: str) -> np.ndarray | None:
         return None
 
 
-EXTENDED_PX = TILE_PX + TILE_PX // 2  # 768 = 512 + 256
+# EXTENDED_PX (768 = 512 + 256) は app/services/detections.py で定義
 
 
 CACHE_3CH_DIR = os.environ.get("CACHE_3CH_DIR", "")
@@ -747,30 +748,11 @@ def scan_tiles(
                                          imgsz=EXTENDED_PX)
             for dets, (tx, ty) in zip(batch_dets, metas_batch):
                 for d in dets:
-                    gcx, gcy = d["cx"], d["cy"]
-                    w, h = d["w"], d["h"]
-                    real_tx = tx + int(gcx) // TILE_PX
-                    real_ty = ty + int(gcy) // TILE_PX
-                    local_cx = gcx - (real_tx - tx) * TILE_PX
-                    local_cy = gcy - (real_ty - ty) * TILE_PX
-
-                    # 中心がbase 512×512内の検出のみ残す
-                    # 拡張領域(512-768)はコンテキスト用。そこに中心がある検出は
-                    # 隣のタイルのbase領域で検出される
-                    if gcx >= TILE_PX or gcy >= TILE_PX:
-                        continue
-                    # 画像左端/上端にかかるbboxはスキップ（部分的にしか見えない）
-                    if gcx - w/2 < 1 or gcy - h/2 < 1:
-                        continue
-
-                    lat, lon = pixel_to_latlon(16, real_tx, real_ty, local_cx, local_cy)
-                    all_detections.append({
-                        "lat": lat, "lon": lon, "conf": d["conf"],
-                        "bbox_cx": local_cx, "bbox_cy": local_cy,
-                        "bbox_w": w, "bbox_h": h,
-                        "tile_x": real_tx, "tile_y": real_ty,
-                        "cls": d.get("cls", 0),
-                    })
+                    # 境界の対象は複数タイルの視野で検出され、サーバー側 dedup が
+                    # 最良の 1 件を残す (resolve_detection の docstring 参照)
+                    rec = resolve_detection(d, tx, ty)
+                    if rec is not None:
+                        all_detections.append(rec)
 
         while True:
             if _is_cancelled():
