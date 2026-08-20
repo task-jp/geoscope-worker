@@ -16,6 +16,19 @@ from app.core.dem import TILE_PX, decode_dem, pixel_to_latlon
 from app.core.visualization import cell_size_m, dem_to_3ch
 
 
+def dataset_code_hash() -> str:
+    """このファイル自身の内容ハッシュ (8 hex 文字)。
+
+    モデルキャッシュのキー (worker.py:_annotations_hash) に混ぜて、教師データ
+    生成コードの変更時にローカル/サーバ/superset の全キャッシュを無効化する。
+    境界クリップ修正のように「アノテーションは同じでも教師データが変わる」
+    変更は、これ無しでは古いコードで学習したモデルが再利用され続ける
+    (実例: 2026-08-20 の千葉スキャンが修正前学習のモデルを 74 秒で再利用)。
+    """
+    import hashlib
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:8]
+
+
 def _tile_path(tiles_dir: str, z: int, tx: int, ty: int) -> Path:
     return Path(tiles_dir) / f"{z}/{tx}/{ty}.webp"
 

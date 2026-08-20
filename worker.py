@@ -881,13 +881,22 @@ def _flush_uploads():
 
 
 def _annotations_hash(annotations: list[dict]) -> str:
-    """Hash voted annotations to detect training data changes."""
+    """Hash voted annotations to detect training data changes.
+
+    dataset.py のコードハッシュも混ぜる: 教師データ生成コードが変わったら、
+    アノテーションが同じでも別モデルとして学習し直す。per-project hash から
+    combined_hash・server meta・superset 判定の全キャッシュ層が導出されるので、
+    ここに混ぜるだけで全層が無効化される。
+    (学習ハイパーパラメータの変更は対象外 — その場合は dataset.py に
+    版数コメントを足すなどでハッシュを変えること)
+    """
     import hashlib
+    from app.services.dataset import dataset_code_hash
     voted = sorted(
         [(a["id"], a.get("annotation_vote", "")) for a in annotations if a.get("annotation_vote")],
         key=lambda x: x[0],
     )
-    return hashlib.sha256(str(voted).encode()).hexdigest()[:16]
+    return hashlib.sha256(f"{dataset_code_hash()}:{voted}".encode()).hexdigest()[:16]
 
 
 def _train_if_needed(job_id: str, project_id: str, config: dict) -> str | None:
