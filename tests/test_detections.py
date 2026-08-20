@@ -72,3 +72,13 @@ def test_same_object_resolves_identically_from_both_views():
         assert from_west_view[key] == pytest.approx(from_own_view[key])
     assert math.isclose(from_west_view["lat"], from_own_view["lat"])
     assert math.isclose(from_west_view["lon"], from_own_view["lon"])
+
+
+def test_resolve_detection_z15_latlon_matches_z16_children():
+    # z15 タイル (tx,ty) の中心画素は、z16 子タイル (2tx,2ty) の右下端に相当する。
+    # 同一地点を z15 と z16 の座標系で解決して lat/lon が一致することを確認。
+    rec15 = resolve_detection(_det(256.0, 256.0, 50.0, 50.0), TX, TY, z=15)
+    rec16 = resolve_detection(_det(512.0 - 0.0, 512.0, 50.0, 50.0), 2 * TX, 2 * TY, z=16)
+    assert rec15 is not None and rec16 is not None
+    assert math.isclose(rec15["lat"], rec16["lat"], abs_tol=1e-12)
+    assert math.isclose(rec15["lon"], rec16["lon"], abs_tol=1e-12)

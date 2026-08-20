@@ -15,7 +15,7 @@ EXTENDED_PX = TILE_PX + TILE_PX // 2  # 768 = 512 + 256
 EDGE_MARGIN_PX = 8
 
 
-def resolve_detection(d: dict, tx: int, ty: int) -> dict | None:
+def resolve_detection(d: dict, tx: int, ty: int, z: int = 16) -> dict | None:
     """拡張画像 (768×768) 上の検出 1 件を、実タイル座標のレコードに解決する。
 
     タイル境界付近の対象は複数タイルの視野に写る (自タイルの base 領域と、
@@ -47,7 +47,7 @@ def resolve_detection(d: dict, tx: int, ty: int) -> dict | None:
     real_ty = ty + int(gcy) // TILE_PX
     local_cx = gcx - (real_tx - tx) * TILE_PX
     local_cy = gcy - (real_ty - ty) * TILE_PX
-    lat, lon = pixel_to_latlon(16, real_tx, real_ty, local_cx, local_cy)
+    lat, lon = pixel_to_latlon(z, real_tx, real_ty, local_cx, local_cy)
     return {
         "lat": lat, "lon": lon, "conf": d["conf"],
         "bbox_cx": local_cx, "bbox_cy": local_cy,

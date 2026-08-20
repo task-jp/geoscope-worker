@@ -1166,6 +1166,20 @@ def _drain_queued_scans() -> tuple[list[dict], list[dict]]:
         else:
             seen.add(pid)
             unique.append(job)
+
+    # ズーム混在排除: 1 バッチは 1 回のスキャンパスなので z を揃える。
+    # 先頭ジョブの z に合わせ、異なる z のジョブは次バッチに回す。
+    if unique:
+        batch_z = (unique[0].get("config") or {}).get("tile_z", 16)
+        same_z = []
+        for job in unique:
+            jz = (job.get("config") or {}).get("tile_z", 16)
+            if jz != batch_z:
+                print(f"  tile_z={jz} differs from batch z={batch_z}, requeueing job {job['id']}")
+                _requeue_job(job["id"])
+            else:
+                same_z.append(job)
+        unique = same_z
     return unique, rescore_jobs
 
 
@@ -1244,6 +1258,8 @@ def _prepare_scan_batch(scan_jobs: list[dict]) -> tuple[dict, list, list, list]:
             "conf_threshold": config.get("conf_threshold", 0.3),
             "job_ids": [j["id"] for j in jobs],
             "scanned_tiles": config.get("scanned_tiles", 0),
+            # バッチ内の z は _drain_queued_scans で揃えてある
+            "tile_z": config.get("tile_z", 16),
         }
 
     all_job_ids = []
@@ -1514,6 +1530,8 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
     # を対象にする。以前は combined_tile_set=None でフォールバックし、結果的に
     # ローカル cache 内のタイルしか走らない「偽物の全国」になっていた。
     update_all(0.30, "スキャン準備中...")
+    # バッチ内の z は _drain_queued_scans で揃えてある (既定 16、z=15 は広域モード)
+    z_scan = next(iter(class_map.values())).get("tile_z", 16) if class_map else 16
     combined_tile_set: set[tuple[int, int]] = set()
     needs_japan_all = False
     for info in class_map.values():
@@ -1522,7 +1540,7 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
             needs_japan_all = True
             break  # 全国は都道府県の上位集合
         try:
-            tiles_data = api_get(f"/api/prefectures/{requests.utils.quote(pref)}/tiles?z=16")
+            tiles_data = api_get(f"/api/prefectures/{requests.utils.quote(pref)}/tiles?z={z_scan}")
             if tiles_data:
                 combined_tile_set |= {(t["x"], t["y"]) for t in tiles_data}
         except Exception as e:
@@ -1531,14 +1549,14 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
     if needs_japan_all:
         try:
             import struct as _struct
-            resp = requests.get(f"{SERVER_URL}/tiles/list/16",
+            resp = requests.get(f"{SERVER_URL}/tiles/list/{z_scan}",
                                 headers=_headers(), timeout=120, verify=_VERIFY_SSL)
             resp.raise_for_status()
             data = resp.content
             combined_tile_set = {
                 _struct.unpack_from("<HH", data, i) for i in range(0, len(data), 4)
             }
-            print(f"  全国 mode: {len(combined_tile_set):,} tiles from /tiles/list/16")
+            print(f"  全国 mode: {len(combined_tile_set):,} tiles from /tiles/list/{z_scan}")
         except Exception as e:
             print(f"  Failed to get Japan-wide tile list: {e}")
             combined_tile_set = set()  # 空 set: 下流で空チェックされ no-op
@@ -1552,7 +1570,9 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
     # 数字の根拠: z=16 の日本本土 land タイルは約 107 万件 (CLAUDE.md / tiles.list)。
     # ネット瞬断 / R2 ダウンで部分取得になっても 80 万切ったら確実に異常。
     # ─────────────────────────────────────────────────────────────
-    SCAN_TILE_FLOOR_JAPAN = 800_000
+    # z=15 は z16 の親タイル (最大 1/4、実測では海岸線の畳み込みでやや多め) なので
+    # floor も 1/4 に落とす
+    SCAN_TILE_FLOOR_JAPAN = 800_000 if z_scan == 16 else 200_000
     n_target = len(combined_tile_set)
     mode_label = "全国" if needs_japan_all else "+".join(
         sorted({(info.get("prefecture") or "?") for info in class_map.values()})
@@ -1573,7 +1593,7 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
     def det_to_annotation(d: dict, scan_label: str) -> dict:
         score = d["conf"]
         import math as _math
-        z, tx, ty = 16, d["tile_x"], d["tile_y"]
+        z, tx, ty = z_scan, d["tile_x"], d["tile_y"]
         cx, cy, w, h = d["bbox_cx"], d["bbox_cy"], d["bbox_w"], d["bbox_h"]
         n = 2 ** z
         lon_west = (tx + (cx - w/2) / 512) / n * 360 - 180
@@ -1658,22 +1678,25 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
         # SKIP_DEM_EXTRACT=true の Pod ではローカルにタイルがほぼ無いため
         # 正しい範囲が得られない (2/2 tiles 空成功問題)。
         all_tiles = [
-            (str(Path(TILES_DIR) / "16" / str(tx) / f"{ty}.webp"), tx, ty)
+            (str(Path(TILES_DIR) / str(z_scan) / str(tx) / f"{ty}.webp"), tx, ty)
             for tx, ty in combined_tile_set
         ]
     else:
         from app.services.scanning import _enumerate_tiles
-        all_tiles = _enumerate_tiles(TILES_DIR, None, fetch_tile if REMOTE_TILES else None)
+        all_tiles = _enumerate_tiles(TILES_DIR, None, fetch_tile if REMOTE_TILES else None,
+                                     z=z_scan)
     total_tiles = len(all_tiles)
 
     # スキャン範囲のタイル全部 + 拡張タイル用隣接を prefetch (R2 並列で高速取得)
     if REMOTE_TILES and total_tiles > 0:
         update_all(0.18, f"スキャン範囲のDEMタイル取得中 ({total_tiles:,}枚)...")
-        z_scan = 16  # 探索は z=16 固定
+        # DEM の実体は z16 のみ。z=15 は子タイルを合成するので prefetch も z16 座標
+        from app.core.dem import dem_deps
         scan_tiles_needed: set[tuple[int, int, int]] = set()
         for _path, tx, ty in all_tiles:
             for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                scan_tiles_needed.add((z_scan, tx + dx, ty + dy))
+                for cx, cy in dem_deps(z_scan, tx + dx, ty + dy):
+                    scan_tiles_needed.add((16, cx, cy))
         _prefetch_tiles(scan_tiles_needed, label="scan-range DEM tiles")
 
     # ⭕タイルに近い順にソート（有望エリアを先にスキャン）
@@ -1682,7 +1705,12 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
         for _pid, annots in project_annotations:
             for a in annots:
                 if a.get("annotation_vote") == "yes" and a.get("tile_x") is not None:
-                    pos_tiles.add((a["tile_x"], a["tile_y"]))
+                    # アノテーションのタイル座標をスキャン z に変換 (z16 → z15 は >>1)
+                    a_z = a.get("tile_z") or 16
+                    shift = a_z - z_scan
+                    if shift < 0:
+                        continue  # スキャン z より粗い座標は近傍ソートに使わない
+                    pos_tiles.add((a["tile_x"] >> shift, a["tile_y"] >> shift))
         if pos_tiles:
             import numpy as np
             from scipy.spatial import cKDTree
@@ -1755,6 +1783,7 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
             tile_fetcher=fetch_tile if REMOTE_TILES else None,
             tile_list=my_tiles,
             cancel_event=_cancel_event,
+            z=z_scan,
         )
 
     _flush_uploads()
@@ -1977,6 +2006,10 @@ def handle_rescore(job: dict):
 
     score_updates = []
     for a in target_annotations:
+        if (a.get("tile_z") or 16) != 16:
+            # z15 広域スキャン由来のアノテーションはタイル座標系が違うため
+            # z16 rescore の対象外 (スコアは変更しない)
+            continue
         tx, ty = a.get("tile_x"), a.get("tile_y")
         if (tx, ty) not in det_by_tile:
             score_updates.append({"annotation_id": a["id"], "score": 0})

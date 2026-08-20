@@ -16,7 +16,8 @@ import cv2
 import numpy as np
 import torch
 
-from app.core.dem import TILE_PX, decode_dem, pixel_to_latlon
+from app.core.dem import (TILE_PX, decode_dem, dem_deps, load_dem_raw,
+                          load_dem_z, pixel_to_latlon)
 from app.core.visualization import cell_size_m, dem_to_3ch
 from app.services.detections import EXTENDED_PX, resolve_detection
 
@@ -72,36 +73,6 @@ def _gen_3ch(args: tuple) -> tuple | None:
         return None
 
 
-@functools.lru_cache(maxsize=128)
-def _load_dem_raw(tile_path: str) -> np.ndarray | None:
-    """Load DEM tile as elevation array without 3ch conversion.
-
-    LRU cache: 各 forkserver worker process 内で memoize する。
-    `_gen_3ch_extended` は隣接タイル (右 / 下 / 右下) を併せて 4 枚読むため、
-    proximity-sort で並んだスキャン中は同じ DEM タイルが直近で再 decode
-    される。cache hit で WebP decode + float64 cast の重複を消す。
-    呼び出し側 (`_gen_3ch_extended` 内 `canvas[...] = main` 等) は配列を
-    mutate していないので cache 共有 (= 同一 ndarray 返却) で安全。
-    """
-    try:
-        data = Path(tile_path).read_bytes()
-        arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-        if arr is None:
-            return None
-        r = arr[:, :, 2].astype(np.float64)
-        g = arr[:, :, 1].astype(np.float64)
-        b = arr[:, :, 0].astype(np.float64)
-        x = r * 65536 + g * 256 + b
-        # 符号付き 24bit。x は 24bit なので `x > 2**24` は絶対に成立せず、
-        # 以前はここが 2**24 だったため負の標高が 167,772m の突起になっていた。
-        # 曲率の正規化は全画面の std/mean を使うので、1 画素の突起で 768x768 の
-        # 全画素が狂う。app/core/dem.py:decode_dem と同じ式にすること。
-        elev = np.where(x == 2**23, np.nan, np.where(x > 2**23, (x - 2**24) * 0.01, x * 0.01))
-        return elev
-    except Exception:
-        return None
-
-
 # EXTENDED_PX (768 = 512 + 256) は app/services/detections.py で定義
 
 
@@ -121,11 +92,11 @@ CACHE_3CH_DIR = os.environ.get("CACHE_3CH_DIR", "")
 _CACHE_3CH_VERSION = "v4"
 
 
-def _cache_base(tx: int) -> Path:
-    return Path(CACHE_3CH_DIR) / _CACHE_3CH_VERSION / "16" / str(tx)
+def _cache_base(tx: int, z: int = 16) -> Path:
+    return Path(CACHE_3CH_DIR) / _CACHE_3CH_VERSION / str(z) / str(tx)
 
 
-def _cache_3ch_read(tx: int, ty: int, src_paths: list[str]) -> tuple | None | str:
+def _cache_3ch_read(tx: int, ty: int, src_paths: list[str], z: int = 16) -> tuple | None | str:
     """3ch キャッシュを引く。戻り値は 3 通り:
       ndarray      : キャッシュヒット (そのまま使える)
       "skip"       : 生成対象外と判定済み (前回 None を返したタイル)
@@ -136,7 +107,7 @@ def _cache_3ch_read(tx: int, ty: int, src_paths: list[str]) -> tuple | None | st
     「更新したのに結果が変わらない」という最悪の不具合になる。
     stat 4 回は生成 308ms に対して無視できるコスト。
     """
-    base = _cache_base(tx)
+    base = _cache_base(tx, z)
     img_p, skip_p = base / f"{ty}.webp", base / f"{ty}.skip"
     try:
         newest_src = max(os.stat(p).st_mtime for p in src_paths if os.path.exists(p))
@@ -185,7 +156,7 @@ def _enc_submit(fn, *a) -> None:
     _ENC_PENDING.append(_ENC_POOL.submit(fn, *a))
 
 
-def _cache_3ch_write_sync(tx: int, ty: int, img: np.ndarray | None) -> None:
+def _cache_3ch_write_sync(tx: int, ty: int, img: np.ndarray | None, z: int = 16) -> None:
     """3ch キャッシュを実際に書く (背景スレッドから呼ばれる)。
     img=None なら "生成対象外" マーカーを置く。
 
@@ -197,7 +168,7 @@ def _cache_3ch_write_sync(tx: int, ty: int, img: np.ndarray | None) -> None:
     32 プロセスが並行して書くので temp + os.replace で原子的に置換する。
     中断で切れたファイルが残ると、次回それを decode して壊れた画像で推論してしまう。
     """
-    base = _cache_base(tx)
+    base = _cache_base(tx, z)
     try:
         base.mkdir(parents=True, exist_ok=True)
         final = base / (f"{ty}.skip" if img is None else f"{ty}.webp")
@@ -214,12 +185,12 @@ def _cache_3ch_write_sync(tx: int, ty: int, img: np.ndarray | None) -> None:
         pass  # キャッシュは最適化なので、書けなくてもスキャンは続ける
 
 
-def _cache_3ch_write(tx: int, ty: int, img: np.ndarray | None) -> None:
+def _cache_3ch_write(tx: int, ty: int, img: np.ndarray | None, z: int = 16) -> None:
     """3ch キャッシュの書き込みを背景スレッドに委ねる。"""
     try:
-        _enc_submit(_cache_3ch_write_sync, tx, ty, img)
+        _enc_submit(_cache_3ch_write_sync, tx, ty, img, z)
     except Exception:
-        _cache_3ch_write_sync(tx, ty, img)
+        _cache_3ch_write_sync(tx, ty, img, z)
 
 
 def _gen_3ch_extended(args: tuple) -> tuple | None:
@@ -236,11 +207,13 @@ def _gen_3ch_extended(args: tuple) -> tuple | None:
     if not CACHE_3CH_DIR:
         return _gen_3ch_uncached(args)
 
-    tiles_dir, tx, ty = args
-    src = [str(Path(tiles_dir) / "16" / str(x) / f"{y}.webp")
-           for x, y in ((tx, ty), (tx + 1, ty), (tx, ty + 1), (tx + 1, ty + 1))]
+    tiles_dir, tx, ty = args[0], args[1], args[2]
+    z = args[3] if len(args) > 3 else 16
+    src = [str(Path(tiles_dir) / "16" / str(cx) / f"{cy}.webp")
+           for x, y in ((tx, ty), (tx + 1, ty), (tx, ty + 1), (tx + 1, ty + 1))
+           for cx, cy in dem_deps(z, x, y)]
 
-    cached = _cache_3ch_read(tx, ty, src)
+    cached = _cache_3ch_read(tx, ty, src, z)
     if isinstance(cached, str):          # "skip" = 前回 None だったタイル
         return None
     if cached is not None:
@@ -249,7 +222,7 @@ def _gen_3ch_extended(args: tuple) -> tuple | None:
     out = _gen_3ch_uncached(args)
     # None も記録する。有効ピクセル 30% 未満や平坦なタイルは全体の一定割合を占め、
     # 記録しないとそのぶんは毎回 308ms を払い続けることになる。
-    _cache_3ch_write(tx, ty, out[0] if out is not None else None)
+    _cache_3ch_write(tx, ty, out[0] if out is not None else None, z)
     return out
 
 
@@ -263,14 +236,14 @@ def _gen_3ch_uncached(args: tuple) -> tuple | None:
     なので、貼るか貼らないかで 768x768 の全画素が変わる (実測 一致率 40%)。
     3ch は DEM の関数であるべきで、スキャン範囲で変わってはいけない。
     """
-    tiles_dir, tx, ty = args
+    tiles_dir, tx, ty = args[0], args[1], args[2]
+    z = args[3] if len(args) > 3 else 16
     half = TILE_PX // 2  # 256
 
     canvas = np.full((EXTENDED_PX, EXTENDED_PX), np.nan)
 
     # メインタイル (0:512, 0:512)
-    path = str(Path(tiles_dir) / "16" / str(tx) / f"{ty}.webp")
-    main = _load_dem_raw(path)
+    main = load_dem_z(tiles_dir, z, tx, ty)
     if main is None:
         return None
     # メインタイル単体で有効ピクセル30%未満ならスキップ
@@ -281,17 +254,17 @@ def _gen_3ch_uncached(args: tuple) -> tuple | None:
     canvas[:TILE_PX, :TILE_PX] = main
 
     # 右タイル (512:768, 0:512) — 左半分の256列
-    right = _load_dem_raw(str(Path(tiles_dir) / "16" / str(tx + 1) / f"{ty}.webp"))
+    right = load_dem_z(tiles_dir, z, tx + 1, ty)
     if right is not None:
         canvas[:TILE_PX, TILE_PX:] = right[:, :half]
 
     # 下タイル (0:512, 512:768) — 上半分の256行
-    below = _load_dem_raw(str(Path(tiles_dir) / "16" / str(tx) / f"{ty + 1}.webp"))
+    below = load_dem_z(tiles_dir, z, tx, ty + 1)
     if below is not None:
         canvas[TILE_PX:, :TILE_PX] = below[:half, :]
 
     # 右下タイル (512:768, 512:768) — 左上256×256
-    diag = _load_dem_raw(str(Path(tiles_dir) / "16" / str(tx + 1) / f"{ty + 1}.webp"))
+    diag = load_dem_z(tiles_dir, z, tx + 1, ty + 1)
     if diag is not None:
         canvas[TILE_PX:, TILE_PX:] = diag[:half, :half]
 
@@ -302,8 +275,8 @@ def _gen_3ch_uncached(args: tuple) -> tuple | None:
     canvas[np.isnan(canvas)] = np.nanmean(canvas) if len(valid) > 0 else 0
 
     try:
-        lat, _ = pixel_to_latlon(16, tx, ty, EXTENDED_PX / 2, EXTENDED_PX / 2)
-        img = dem_to_3ch(canvas, cell_size_m(lat, 16))
+        lat, _ = pixel_to_latlon(z, tx, ty, EXTENDED_PX / 2, EXTENDED_PX / 2)
+        img = dem_to_3ch(canvas, cell_size_m(lat, z))
         if min(img[:, :, c].std() for c in range(3)) < 3:
             return None
         return (img, tx, ty)
@@ -504,20 +477,22 @@ def _latlon_to_tile(lat: float, lon: float, z: int = 16) -> tuple[int, int]:
 
 
 def _enumerate_tiles(tiles_dir: str, region: dict | None = None,
-                     tile_fetcher: Callable | None = None) -> list[tuple[str, int, int]]:
-    """List all z=16 tiles, optionally filtered to a bounding box.
+                     tile_fetcher: Callable | None = None,
+                     z: int = 16) -> list[tuple[str, int, int]]:
+    """List all tiles at zoom z, optionally filtered to a bounding box.
 
     If tile_fetcher is provided and region is set, generates tile coordinates
     even if local files don't exist (tile_fetcher will download them on demand).
+    ローカルファイルは z16 のみ存在するので、z=15 はユニークな親座標に畳む。
     """
     scan_dir = Path(tiles_dir) / "16"
 
     # Compute tile range if region is given
     tx_min = ty_min = 0
-    tx_max = ty_max = 2 ** 16 - 1
+    tx_max = ty_max = 2 ** z - 1
     if region:
-        tx_min, ty_max_r = _latlon_to_tile(region["south"], region["west"])
-        tx_max, ty_min_r = _latlon_to_tile(region["north"], region["east"])
+        tx_min, ty_max_r = _latlon_to_tile(region["south"], region["west"], z)
+        tx_max, ty_min_r = _latlon_to_tile(region["north"], region["east"], z)
         ty_min = ty_min_r
         ty_max = ty_max_r
 
@@ -527,7 +502,7 @@ def _enumerate_tiles(tiles_dir: str, region: dict | None = None,
         tiles = []
         for tx in range(tx_min, tx_max + 1):
             for ty in range(ty_min, ty_max + 1):
-                local = Path(tiles_dir) / "16" / str(tx) / f"{ty}.webp"
+                local = Path(tiles_dir) / str(z) / str(tx) / f"{ty}.webp"
                 tiles.append((str(local), tx, ty))
         return tiles
 
@@ -535,17 +510,20 @@ def _enumerate_tiles(tiles_dir: str, region: dict | None = None,
     if not scan_dir.exists():
         return []
 
+    shift = 16 - z
+    seen: set[tuple[int, int]] = set()
     tiles = []
     for x_dir in sorted(scan_dir.iterdir()):
         if not x_dir.is_dir():
             continue
-        tx = int(x_dir.name)
+        tx = int(x_dir.name) >> shift
         if tx < tx_min or tx > tx_max:
             continue
         for f in sorted(x_dir.glob("*.webp")):
-            ty = int(f.stem)
-            if ty < ty_min or ty > ty_max:
+            ty = int(f.stem) >> shift
+            if ty < ty_min or ty > ty_max or (tx, ty) in seen:
                 continue
+            seen.add((tx, ty))
             tiles.append((str(f), tx, ty))
 
     return tiles
@@ -570,6 +548,7 @@ def scan_tiles(
     progress_save_callback: Callable[[int], None] | None = None,
     tile_list: list[tuple[str, int, int]] | None = None,
     cancel_event: "threading.Event | None" = None,
+    z: int = 16,
 ) -> list[dict]:
     """Run inference on all (or region-filtered) DEM tiles.
 
@@ -615,7 +594,7 @@ def scan_tiles(
     # 150%拡張タイル: 各タイルを768×768に拡張（右+256, 下+256, 右下+256×256）
     # 隣接タイルはスキャン対象集合に入っているかで絞らない。絞ると都道府県
     # スキャンの縁で学習側と違う画像になる (_gen_3ch_uncached の docstring 参照)。
-    extended_tiles = [(tiles_dir, tx, ty) for _, tx, ty in tiles]
+    extended_tiles = [(tiles_dir, tx, ty, z) for _, tx, ty in tiles]
 
     total_tiles = len(extended_tiles)
 
@@ -656,11 +635,13 @@ def scan_tiles(
                 pending: dict = {}        # et -> set of base coords still missing
                 waiters: dict = {}        # base coord -> list of et waiting
                 for et in extended_tiles:
-                    _, tx, ty = et
+                    _, tx, ty = et[0], et[1], et[2]
                     # 隣接も必ず取る。取らないと 3ch が学習側と食い違う
                     # (_gen_3ch_uncached の docstring 参照)。存在しない座標は
                     # fetch_tile が .404 マーカーに記録するので 2 回目以降は無料。
-                    et_deps = {(tx, ty), (tx + 1, ty), (tx, ty + 1), (tx + 1, ty + 1)}
+                    # deps は常に z16 の実ファイル座標 (z=15 は子タイル 2×2 を合成)。
+                    et_deps = {c for nx, ny in ((tx, ty), (tx + 1, ty), (tx, ty + 1), (tx + 1, ty + 1))
+                               for c in dem_deps(z, nx, ny)}
                     pending[et] = et_deps
                     for d in et_deps:
                         waiters.setdefault(d, []).append(et)
@@ -750,7 +731,7 @@ def scan_tiles(
                 for d in dets:
                     # 境界の対象は複数タイルの視野で検出され、サーバー側 dedup が
                     # 最良の 1 件を残す (resolve_detection の docstring 参照)
-                    rec = resolve_detection(d, tx, ty)
+                    rec = resolve_detection(d, tx, ty, z)
                     if rec is not None:
                         all_detections.append(rec)
 
