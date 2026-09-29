@@ -204,11 +204,13 @@ def _gen_3ch_extended(args: tuple) -> tuple | None:
     全国スキャンの律速が CPU から GPU に移り 100 → 243 tile/s になる。
     既定は無効 (120 万枚で約 790GB 使うため、明示的に有効化させる)。
     """
-    if not CACHE_3CH_DIR:
-        return _gen_3ch_uncached(args)
-
     tiles_dir, tx, ty = args[0], args[1], args[2]
     z = args[3] if len(args) > 3 else 16
+    # キャッシュは z16 だけ。z15 (広域) は使用頻度が低いのに 32 万枚で約 205GB
+    # 食っていた (実測)。z15 は作り直しても 1 回のスキャン分の CPU で済むので、
+    # ディスクを払うより得。
+    if not CACHE_3CH_DIR or z != 16:
+        return _gen_3ch_uncached(args)
     src = [str(Path(tiles_dir) / "16" / str(cx) / f"{cy}.webp")
            for x, y in ((tx, ty), (tx + 1, ty), (tx, ty + 1), (tx + 1, ty + 1))
            for cx, cy in dem_deps(z, x, y)]
