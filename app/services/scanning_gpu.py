@@ -41,7 +41,7 @@ from app.services.detections import resolve_detection
 
 HALF = TILE_PX // 2
 WINDOW = int(os.environ.get("SCAN_WINDOW", "1024"))        # 進捗保存とタイル並べ替えの単位
-GEN_BATCH = int(os.environ.get("GPU_3CH_BATCH", "64"))      # CUDA Graph のバッチ (静的)。64 で主スレッドの投入回数を半減
+GEN_BATCH = int(os.environ.get("GPU_3CH_BATCH", "32"))      # CUDA Graph のバッチ (静的)。Graph の私有メモリは ksize 5 種 × バッチに比例 (32 で約 2.4GB、64 で 4.8GB)
 LRU_TILES = int(os.environ.get("DEM_LRU_TILES", "1024"))    # 復号プロセスごとの DEM キャッシュ (約 2 列分)
 
 
@@ -52,7 +52,7 @@ def gpu_scan_available(model_type: str, z: int) -> bool:
     return model_type == "yolo" and z == 16 and torch.cuda.is_available()
 
 
-def prepare_direct_model(model, conf_threshold: float, device):
+def prepare_direct_model(model, conf_threshold: float, device, progress=None):
     """predictor を初期化して end2end (NMS-free) の生モデルを返す。end2end でなければ None。
     判定をここで済ませ、scan_tiles_gpu の中では例外を握りつぶさない (途中の失敗を CPU 経路で
     黙ってやり直すと、遅くなった理由が見えなくなる)。"""
@@ -76,15 +76,74 @@ def prepare_direct_model(model, conf_threshold: float, device):
     if os.environ.get("GPU_INFER_CHANNELS_LAST", "1") != "0":
         # channels_last は fp16 の畳み込みが速い (0.77 → 0.66 ms/枚)。conf の差は最大 0.001 (検出一致を確認済み)
         net = net.to(memory_format=torch.channels_last)
-    if os.environ.get("GPU_INFER_COMPILE", "0") == "1":
-        try:
-            compiled = torch.compile(net, dynamic=False)
-            with torch.no_grad():
-                compiled(dummy.half() if os.environ.get("GPU_INFER_HALF", "1") != "0" else dummy)
-            net = compiled
-        except Exception:
-            pass   # コンパイラが無い環境では eager のまま
     return net
+
+
+TRT_BATCH = 128   # engine は固定バッチ。推論バッチもこれに合わせる (端数は先頭を複製して埋める)
+
+
+class _TRTModel(torch.nn.Module):
+    """TensorRT engine を infer_yolo_direct から呼べる形にする。入力は float32 NCHW 連続、固定バッチ。"""
+
+    def __init__(self, backend, device):
+        super().__init__()
+        self.backend = backend
+        self.marker = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16, device=device), requires_grad=False)  # _is_half → True
+
+    def forward(self, b):
+        n = b.shape[0]
+        if n > TRT_BATCH:   # engine は固定バッチ。超過分が黙って落ちると検出が失われるので止める
+            raise ValueError(f"TensorRT batch {n} > {TRT_BATCH}")
+        if n < TRT_BATCH:
+            b = torch.cat([b, b[:1].expand(TRT_BATCH - n, -1, -1, -1)])
+        # 前回の入力は使い終わっている (execute_async_v3 の後に .cpu() で同期している) ので 1 面だけ持つ
+        x = b.float().contiguous()
+        self._keep_alive = None
+        # ultralytics の backend は execute_v2 (同期・レガシー既定ストリーム) で、3ch 生成のストリームと直列化され
+        # 生成バッチが 24 → 65 ms になった (実測)。torch の現在ストリームで非同期に実行して並行性を保つ。
+        # 入力 x は enqueue 後も参照を保つ必要がある (ストリーム順で読み終わるまで解放されないよう self に置く)
+        ctx = self.backend.context
+        ctx.set_tensor_address("images", int(x.data_ptr()))
+        out_name = sorted(self.backend.output_names)[0]
+        out = self.backend.bindings[out_name].data
+        ctx.set_tensor_address(out_name, int(out.data_ptr()))
+        if not ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream):
+            raise RuntimeError("TensorRT execute_async_v3 failed")
+        self._keep_alive = x
+        return out[:n]
+
+
+def _try_tensorrt(model, device, progress=None):
+    """学習済み .pt から TensorRT fp16 engine を作って (無ければ)、読み込む。失敗したら None (eager fp16 のまま)。
+    engine は GPU 機種ごとに違うので、同じディレクトリに <stem>.b128.i768.engine として置き、再利用する。
+    export には 1〜2 分かかる。"""
+    try:
+        import tensorrt  # noqa: F401
+    except Exception:
+        return None
+    try:
+        from ultralytics import YOLO
+        pt = Path(model.ckpt_path if getattr(model, "ckpt_path", None) else model.overrides.get("model", ""))
+        if not pt.exists():
+            return None
+        eng = pt.with_name(f"{pt.stem}.b{TRT_BATCH}.i{EXTENDED_PX}.engine")
+        if not eng.exists():
+            if progress:
+                progress(0.0, "TensorRT engine を構築中 (1〜2 分、初回のみ)")
+            t0 = time.monotonic()
+            out = YOLO(str(pt)).export(format="engine", half=True, imgsz=EXTENDED_PX, batch=TRT_BATCH,
+                                       dynamic=False, device=device.index or 0, verbose=False, workspace=4)
+            Path(out).rename(eng)
+            if progress:
+                progress(0.0, f"TensorRT engine 構築 {time.monotonic() - t0:.0f} 秒")
+        m = YOLO(str(eng), task="detect")
+        dummy = torch.zeros((TRT_BATCH, 3, EXTENDED_PX, EXTENDED_PX), device=device)
+        m.predict(dummy, imgsz=EXTENDED_PX, device=device.index or 0, verbose=False, half=True, batch=TRT_BATCH)
+        return _TRTModel(m.predictor.model, device)
+    except Exception as e:   # engine が作れない GPU/環境では eager に戻る
+        if progress:
+            progress(0.0, f"TensorRT unavailable ({type(e).__name__}); eager fp16")
+        return None
 
 
 # ---------------------------------------------------------------- 復号プロセス側
@@ -188,6 +247,7 @@ def _slot_count(requested: int) -> int:
 # ---------------------------------------------------------------- 本体
 def scan_tiles_gpu(
     net,
+    model,
     tiles_dir: str,
     tiles: list[tuple[str, int, int]],
     conf_threshold: float,
@@ -233,7 +293,18 @@ def scan_tiles_gpu(
     try:
         view = np.ndarray((slots, EXTENDED_PX, EXTENDED_PX, 3), np.uint8, buffer=shm.buf)
         shm_t = torch.from_numpy(view)
-        registered = int(torch.cuda.cudart().cudaHostRegister(shm_t.data_ptr(), shm_t.numel(), 0)) == 0
+        # 共有メモリをピン止め (DMA 可能に) する。失敗すると H2D が同期コピーになり、生成バッチが 12 → 33 ms に
+        # 落ちる (実測)。GPU メモリをたくさん使った後 (TensorRT のコンテキスト等) だと失敗することがあるので、
+        # TensorRT の初期化より先に行う
+        rc = int(torch.cuda.cudart().cudaHostRegister(shm_t.data_ptr(), shm_t.numel(), 0))
+        registered = rc == 0
+        if not registered:
+            print(f"[scanning_gpu] cudaHostRegister failed (rc={rc}); host→GPU copies will be slow", flush=True)
+        if os.environ.get("GPU_INFER_TRT", "1") != "0":
+            trt = _try_tensorrt(model, device, progress_callback)
+            if trt is not None:
+                net = trt
+                batch_size = TRT_BATCH   # engine の固定バッチに合わせる (リングもこの値で作る)
         gen = GraphGen(device, GEN_BATCH, shm_t, compiled=os.environ.get("GPU_3CH_COMPILE", "1") != "0", output="infer")
         # 推論入力のリング 2 面 (生成が片方に書いている間にもう片方を推論する)。channels_last は畳み込みが速い
         ring_cap = batch_size + GEN_BATCH
@@ -307,6 +378,8 @@ def scan_tiles_gpu(
         t0 = time.monotonic()
         prof = {"wait": 0.0, "issue": 0.0, "gather": 0.0, "infer": 0.0, "n_gen": 0, "n_inf": 0}
         profiling = os.environ.get("GPU_3CH_PROFILE", "0") == "1"
+        timeline = []            # (kind, start_event, end_event) 最初の数十件だけ
+        t_ref = torch.cuda.Event(enable_timing=True); t_ref.record()
 
         def release_slots():
             nonlocal pending_release
@@ -331,7 +404,9 @@ def scan_tiles_gpu(
             ring_pos += len(items)
             imgs, keep, ev, h2d = gen(items, dst=dst)
             prof["issue"] += time.perf_counter() - tq; prof["n_gen"] += 1
-            ready.append((imgs, keep, [(it[3], it[4]) for it in items], ev))
+            ready.append((imgs, keep, [(it[3], it[4]) for it in items], ev, gen.last_start_ev, time.perf_counter()))
+            if profiling and len(timeline) < 60:
+                timeline.append(("gen", gen.last_start_ev, ev))
             n_ready += len(items)
             pending_release.append((h2d, [it[0] for it in items]))
 
@@ -348,6 +423,11 @@ def scan_tiles_gpu(
             cur = torch.cuda.current_stream()
             for r in take:
                 cur.wait_event(r[3])
+            if profiling:
+                torch.cuda.synchronize()
+                for r in take:
+                    prof["gen_gpu_ms"] = prof.get("gen_gpu_ms", 0.0) + r[3].elapsed_time(r[4]) if False else prof.get("gen_gpu_ms", 0.0) + r[4].elapsed_time(r[3])
+                    prof["gen_age_ms"] = prof.get("gen_age_ms", 0.0) + (time.perf_counter() - r[5]) * 1000
             total_n = sum(len(r[2]) for r in take)
             imgs = rings[ring_i][:total_n]
             kl = torch.cat([r[1] for r in take]).tolist()
@@ -358,7 +438,11 @@ def scan_tiles_gpu(
             if not any(kl):
                 return
             tq = time.perf_counter()
+            if profiling and len(timeline) < 60:
+                e0 = torch.cuda.Event(enable_timing=True); e0.record()
             batch_dets = infer_yolo_direct(net, imgs, conf_threshold)
+            if profiling and len(timeline) < 60:
+                e1 = torch.cuda.Event(enable_timing=True); e1.record(); timeline.append(("inf", e0, e1))
             prof["infer"] += time.perf_counter() - tq; prof["n_inf"] += 1
             batch_dets = [d for d, kp in zip(batch_dets, kl) if kp]
             metas = [m for m, kp in zip(metas, kl) if kp]
@@ -433,10 +517,17 @@ def scan_tiles_gpu(
             if progress_save_callback:
                 progress_save_callback(resume_from + processed)
             if profiling and progress_callback and processed:
+                torch.cuda.synchronize()
+                lines = []
+                for kind, a, b in timeline[12:40]:
+                    lines.append(f"{kind} {t_ref.elapsed_time(a):8.1f}→{t_ref.elapsed_time(b):8.1f} ({b.elapsed_time(a)*-1:5.1f}ms)" if False else
+                                 f"{kind} {t_ref.elapsed_time(a):8.1f}→{t_ref.elapsed_time(b):8.1f} ({a.elapsed_time(b):5.1f}ms)")
+                progress_callback(1.0, "timeline " + " | ".join(lines))
                 per = 1000 / processed
-                progress_callback(1.0, "profile ms/tile: wait-for-decoders %.2f | gen-issue %.2f | gather %.2f | infer %.2f | wall %.2f (gen calls %d, infer calls %d)" % (
+                progress_callback(1.0, "profile ms/tile: wait-for-decoders %.2f | gen-issue %.2f | gather %.2f | infer %.2f | wall %.2f (gen calls %d, infer calls %d; per gen batch: GPU %.1f ms, issue→gather %.1f ms)" % (
                     prof["wait"] * per, prof["issue"] * per, prof["gather"] * per, prof["infer"] * per,
-                    (time.monotonic() - t0) * per, prof["n_gen"], prof["n_inf"]))
+                    (time.monotonic() - t0) * per, prof["n_gen"], prof["n_inf"],
+                    prof.get("gen_gpu_ms", 0.0) / max(1, prof["n_gen"]), prof.get("gen_age_ms", 0.0) / max(1, prof["n_gen"])))
     finally:
         stop.set()
         for p in procs:

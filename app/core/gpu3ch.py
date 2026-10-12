@@ -220,7 +220,9 @@ def back_infer(ch0: torch.Tensor, ch1: torch.Tensor, ch2: torch.Tensor, cnt: tor
     s2 = (x * x).sum(dim=(2, 3)).to(DT)
     std = torch.sqrt(torch.clamp(s2 / n - (s1 / n) ** 2, min=0))
     keep = (std.min(dim=1).values >= 3) & (cnt >= MIN_VALID)
-    return q[:, [2, 1, 0]].half() / 255, keep
+    # チャンネル順 BGR → RGB。[2,1,0] の添字指定は CPU 側の index テンソルを同期コピーするため CUDA Graph の
+    # 捕捉中に使えない (eager で捕捉する環境で落ちた)。flip は GPU だけで完結する
+    return q.flip(1).half() / 255, keep
 
 
 def dem_to_3ch_gpu(bgr_u8: torch.Tensor, cs: torch.Tensor, curv: CurvFFT, fp32: bool = False):
@@ -290,10 +292,12 @@ class GraphGen:
                 for _ in range(2):
                     gen_fn(s_bgr, s_cs)
             torch.cuda.synchronize()
-        except Exception:
+        except Exception as e:
             if not self.compiled:
                 raise
-            # コンパイル済み関数の実行に失敗 (Triton のビルド失敗など) → eager で作り直す
+            # コンパイル済み関数の実行に失敗 (Triton のビルド失敗など) → eager で作り直す。理由は必ず残す
+            # (eager は 1.6 ms/枚で、黙って落ちると「なぜか遅い」になる)
+            print(f"[gpu3ch] torch.compile path failed, falling back to eager: {type(e).__name__}: {str(e)[:300]}", flush=True)
             self.compiled = False
             self._build(k)
             return
@@ -327,6 +331,8 @@ class GraphGen:
         cs.copy_(torch.tensor([it[1] for it in items] + [items[0][1]] * (self.B - n), dtype=DT))
         with torch.cuda.stream(self.stream):
             self.stream.wait_event(done_ev)            # 同じ Graph の前回再生 (静的バッファ使用中) を待つ
+            start_ev = torch.cuda.Event(enable_timing=True)
+            start_ev.record(self.stream)
             for i, it in enumerate(items):
                 s_bgr[i].copy_(self.shm[it[0]], non_blocking=True)
             if n < self.B:
@@ -343,8 +349,9 @@ class GraphGen:
                 imgs = o_img[:n].clone()
             keep = o_keep[:n].clone()
             done_ev.record(self.stream)
-            ready_ev = torch.cuda.Event()
+            ready_ev = torch.cuda.Event(enable_timing=True)
             ready_ev.record(self.stream)
+        self.last_start_ev = start_ev   # profile 用: ready_ev.elapsed_time(start_ev) で GPU 上の所要時間
         return imgs, keep, ready_ev, h2d_ev
 
 

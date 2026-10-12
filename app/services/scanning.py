@@ -575,13 +575,13 @@ def scan_tiles(
     # z=15、RT-DETR、CUDA 無し (Mac の MPS は倍精度非対応) は従来の CPU 生成経路のまま。
     from app.services.scanning_gpu import gpu_scan_available, prepare_direct_model, scan_tiles_gpu
     if gpu_scan_available(model_type, z):
-        net = prepare_direct_model(model, conf_threshold, device)
+        net = prepare_direct_model(model, conf_threshold, device, progress_callback)
         if net is None:   # end2end でないモデル (yolo11 など) → 従来経路
             if progress_callback:
                 progress_callback(resume_from / max(1, len(tiles)), "model is not end2end; CPU 3ch path")
         else:
             return scan_tiles_gpu(
-                net, tiles_dir, tiles, conf_threshold, batch_size, num_workers,
+                net, model, tiles_dir, tiles, conf_threshold, batch_size, num_workers,
                 progress_callback, detection_callback, tile_fetcher, resume_from,
                 progress_save_callback, cancel_event, z=z,
             )
