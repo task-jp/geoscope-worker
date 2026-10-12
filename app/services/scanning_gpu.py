@@ -172,7 +172,7 @@ def _try_tensorrt(model, device, progress=None):
             return None
         eng = pt.with_name(f"{pt.stem}.b{TRT_BATCH}.i{EXTENDED_PX}.engine")
         key = str(eng.resolve())
-        if key in _TRT_CACHE:
+        if key in _TRT_CACHE:          # 失敗 (None) も覚えておき、50,000 枚ごとの呼び出しで export をやり直さない
             return _TRT_CACHE[key]
         if not eng.exists():
             _build_trt_engine(pt, eng, device, progress)
@@ -190,6 +190,7 @@ def _try_tensorrt(model, device, progress=None):
         if progress:
             progress(0.0, f"TensorRT unavailable ({type(e).__name__}: {str(e)[:120]}); eager fp16")
         print(f"[scanning_gpu] TensorRT unavailable: {type(e).__name__}: {e}", flush=True)
+        _TRT_CACHE[str(eng.resolve()) if 'eng' in dir() else 'failed'] = None   # チャンクごとに export を繰り返さない
         return None
 
 
@@ -575,18 +576,21 @@ def scan_tiles_gpu(
             torch.cuda.synchronize()
             if progress_save_callback:
                 progress_save_callback(resume_from + processed)
-            if profiling and progress_callback and processed:
+            if profiling and processed:
                 torch.cuda.synchronize()
                 lines = []
                 for kind, a, b in timeline[12:40]:
                     lines.append(f"{kind} {t_ref.elapsed_time(a):8.1f}→{t_ref.elapsed_time(b):8.1f} ({b.elapsed_time(a)*-1:5.1f}ms)" if False else
                                  f"{kind} {t_ref.elapsed_time(a):8.1f}→{t_ref.elapsed_time(b):8.1f} ({a.elapsed_time(b):5.1f}ms)")
-                progress_callback(1.0, "timeline " + " | ".join(lines))
                 per = 1000 / processed
-                progress_callback(1.0, "profile ms/tile: wait-for-decoders %.2f | gen-issue %.2f | gather %.2f | infer %.2f | wall %.2f (gen calls %d, infer calls %d; per gen batch: GPU %.1f ms, issue→gather %.1f ms)" % (
+                msg = "profile ms/tile: wait-for-decoders %.2f | gen-issue %.2f | gather %.2f | infer %.2f | wall %.2f (gen calls %d, infer calls %d; per gen batch: GPU %.1f ms, issue→gather %.1f ms)" % (
                     prof["wait"] * per, prof["issue"] * per, prof["gather"] * per, prof["infer"] * per,
                     (time.monotonic() - t0) * per, prof["n_gen"], prof["n_inf"],
-                    prof.get("gen_gpu_ms", 0.0) / max(1, prof["n_gen"]), prof.get("gen_age_ms", 0.0) / max(1, prof["n_gen"])))
+                    prof.get("gen_gpu_ms", 0.0) / max(1, prof["n_gen"]), prof.get("gen_age_ms", 0.0) / max(1, prof["n_gen"]))
+                print("[scanning_gpu] " + msg, flush=True)        # ワーカーのログにも残す (進捗メッセージは上書きされる)
+                if progress_callback:
+                    progress_callback(1.0, "timeline " + " | ".join(lines))
+                    progress_callback(1.0, msg)
     finally:
         stop.set()
         for p in procs:
