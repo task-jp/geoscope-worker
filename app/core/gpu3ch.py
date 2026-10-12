@@ -280,6 +280,15 @@ class GraphGen:
 
 
 # ---------------------------------------------------------------- 直接推論
+def _is_half(net) -> bool:
+    """AutoBackend は内部モデル (net.model) を子モジュールとして登録しないので、そちらの重みを見る。"""
+    inner = getattr(net, "model", net)
+    try:
+        return next(inner.parameters()).dtype == torch.float16
+    except (StopIteration, AttributeError, TypeError):
+        return False
+
+
 @torch.no_grad()
 def infer_yolo_direct(net, imgs_u8: torch.Tensor, conf: float, max_det: int = 300) -> list[list[dict]]:
     """ultralytics の model.predict と同じ結果を、ラッパーを通さずに得る。
@@ -290,13 +299,15 @@ def infer_yolo_direct(net, imgs_u8: torch.Tensor, conf: float, max_det: int = 30
     scale_boxes = clip だけ。ここではそれをバッチで行い、CPU への転送を 1 回にする。
     辞書化は scanning._infer_yolo と同じ float32 演算。実測で predict と 442/442 件ビット一致。
     """
-    batch = imgs_u8.permute(0, 3, 1, 2)[:, [2, 1, 0]].float() / 255
+    half = _is_half(net)
+    batch = imgs_u8.permute(0, 3, 1, 2)[:, [2, 1, 0]]
+    batch = (batch.half() if half else batch.float()) / 255
     preds = net(batch)
     if isinstance(preds, (list, tuple)):
         preds = preds[0]
     if preds.ndim != 3 or preds.shape[-1] != 6:
         raise ValueError(f"end2end (NMS-free) の出力を想定: {tuple(preds.shape)}")
-    preds = preds[:, :max_det]
+    preds = preds.float()[:, :max_det]
     mask = preds[..., 4] > conf
     p = preds.clone()
     w = h = float(imgs_u8.shape[2])
