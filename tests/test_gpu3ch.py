@@ -53,14 +53,13 @@ def test_gpu_matches_cpu_pixels():
     elevs = [_synthetic_dem(s) for s in range(3)]
     css = [cell_size_m(lat, 16) for lat in (35.0, 43.0, 26.5)]
     bgr = torch.from_numpy(np.stack([_encode_bgr(e) for e in elevs])).to(dev)
-    means = torch.tensor([float(np.nanmean(e)) for e in elevs], dtype=gpu3ch.DT, device=dev)
     cs = torch.tensor(css, dtype=gpu3ch.DT)
     for i, (e, c) in enumerate(zip(elevs, css)):
         filled = e.copy(); filled[np.isnan(filled)] = np.nanmean(e)
         ref = dem_to_3ch(filled, c)
         k = gpu3ch.ksize_for(c)
         curv = gpu3ch.CurvFFT(k, 768, 768, dev)
-        img, keep = gpu3ch.dem_to_3ch_gpu(bgr[i:i + 1], means[i:i + 1], cs[i:i + 1].to(dev), curv)
+        img, keep = gpu3ch.dem_to_3ch_gpu(bgr[i:i + 1], cs[i:i + 1].to(dev), curv)
         got = img[0].cpu().numpy()
         diff = np.abs(got.astype(np.int16) - ref.astype(np.int16))
         # 丸め順序の違いで 1 階調の差がごく稀に出る (実測 51 億値に 1 値)。2 以上の差は不正。
@@ -70,7 +69,8 @@ def test_gpu_matches_cpu_pixels():
 
 
 @cuda
-def test_graph_matches_eager():
+def test_graph_matches_eager(monkeypatch):
+    monkeypatch.setattr(gpu3ch, "PRECISION", "fp64")   # 基準の eager 版は fp64 なので Graph も fp64 で作る
     dev = torch.device("cuda")
     B = 4
     shm = torch.zeros((8, 768, 768, 3), dtype=torch.uint8).pin_memory()
@@ -78,13 +78,12 @@ def test_graph_matches_eager():
     for i, e in enumerate(elevs):
         shm[i] = torch.from_numpy(_encode_bgr(e))
     cs = cell_size_m(36.0, 16)
-    items = [(i, float(np.nanmean(e)), cs, gpu3ch.ksize_for(cs)) for i, e in enumerate(elevs)]
+    items = [(i, cs, gpu3ch.ksize_for(cs)) for i, e in enumerate(elevs)]
     gen = gpu3ch.GraphGen(dev, B, shm, compiled=False)
     imgs, keep, ev, h2d = gen(items)
     torch.cuda.synchronize()
-    curv = gpu3ch.CurvFFT(items[0][3], 768, 768, dev)
-    ref, rkeep = gpu3ch.dem_to_3ch_gpu(shm[:B].to(dev), torch.tensor([it[1] for it in items], dtype=gpu3ch.DT, device=dev),
-                                       torch.tensor([cs] * B, dtype=gpu3ch.DT, device=dev), curv)
+    curv = gpu3ch.CurvFFT(items[0][2], 768, 768, dev)
+    ref, rkeep = gpu3ch.dem_to_3ch_gpu(shm[:B].to(dev), torch.tensor([cs] * B, dtype=gpu3ch.DT, device=dev), curv)
     assert torch.equal(imgs, ref) and torch.equal(keep, rkeep)
     # 2 回目 (同じ Graph の再生) も同じ
     imgs2, keep2, _, _ = gen(items)
@@ -112,3 +111,15 @@ def test_direct_postprocess_matches_ultralytics():
         exp = [{"cx": float((x1 + x2) / 2), "cy": float((y1 + y2) / 2), "w": float(x2 - x1), "h": float(y2 - y1),
                 "conf": float(cf), "cls": int(cl)} for x1, y1, x2, y2, cf, cl in pred.numpy()]
         assert got[b] == exp
+
+
+@cuda
+def test_fp32_path_close_to_fp64():
+    dev = torch.device("cuda")
+    e = _synthetic_dem(21); c = cell_size_m(35.0, 16); k = gpu3ch.ksize_for(c)
+    bgr = torch.from_numpy(_encode_bgr(e)[None]).to(dev); cs = torch.tensor([c], dtype=gpu3ch.DT, device=dev)
+    img64, keep64 = gpu3ch.dem_to_3ch_gpu(bgr, cs, gpu3ch.CurvFFT(k, 768, 768, dev), fp32=False)
+    img32, keep32 = gpu3ch.dem_to_3ch_gpu(bgr, cs, gpu3ch.CurvFFT32(k, 768, 768, dev), fp32=True)
+    d = (img32.to(torch.int16) - img64.to(torch.int16)).abs()
+    assert int(d.max()) <= 1 and float((d > 0).float().mean()) < 1e-3
+    assert bool(keep32[0]) == bool(keep64[0])

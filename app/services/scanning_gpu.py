@@ -6,7 +6,10 @@
              → forward + end2end 後処理 (バッチ) → resolve_detection
 
 scan_tiles (CPU 生成 + 3ch キャッシュ) との違い:
-  - 3ch キャッシュを使わない。生成が推論より速いので要らない (実測: 本番設定 111 → 413 tile/s)。
+  - 3ch キャッシュを使わない。生成が推論より速いので要らない (実測: 旧 213 → 911 tile/s、同じ密な 18k 枚)。
+  - 生成は fp32、復号プロセスは uint8 を置くだけ (有効判定・NaN 埋めの平均は GPU)、生成結果は推論入力の
+    形式 (fp16 RGB /255、channels_last) でリングバッファに直接書く。推論は eager fp16 (torch.compile は
+    検出が変わるため不採用)。
   - プロセス間で画像を pickle しない (1 枚 1.77MB × 数百/秒 が主スレッドの CPU を食っていた)。
   - 復号プロセスには「同じ列の連続した行」をまとめて渡す。隣接タイル (右・下・右下) を LRU で
     再利用でき、DEM の読みが 1 枚あたり ~1.3 ファイルで済む (NAS や R2 から読むときに効く)。
@@ -38,7 +41,7 @@ from app.services.detections import resolve_detection
 
 HALF = TILE_PX // 2
 WINDOW = int(os.environ.get("SCAN_WINDOW", "1024"))        # 進捗保存とタイル並べ替えの単位
-GEN_BATCH = int(os.environ.get("GPU_3CH_BATCH", "32"))      # CUDA Graph のバッチ (静的)
+GEN_BATCH = int(os.environ.get("GPU_3CH_BATCH", "64"))      # CUDA Graph のバッチ (静的)。64 で主スレッドの投入回数を半減
 LRU_TILES = int(os.environ.get("DEM_LRU_TILES", "1024"))    # 復号プロセスごとの DEM キャッシュ (約 2 列分)
 
 
@@ -62,22 +65,29 @@ def prepare_direct_model(model, conf_threshold: float, device):
         preds = preds[0]
     if preds.ndim != 3 or preds.shape[-1] != 6:
         return None
+    # AutoBackend のラッパーを外して内部モデルを直接呼ぶ (forward 以外の仕事は無い)。
+    # torch.compile はラッパー越しだと効かない (self.model 差し替えでは forward が捕まらない) ので、ここで内部モデルに掛ける
+    net = net.model
     if os.environ.get("GPU_INFER_HALF", "1") != "0":
         # fp16 推論 (既定)。前方後円墳モデルでの評価 (2026-10-12): val mAP50 0.8231→0.8230、⭕ 再現 527/632 で同数、
         # スキャン相当の検出 778 件中 777 件一致 (conf 差 最大 0.0065)、速度 432→563 tile/s。
         # 採用基準「YOLO のスキャンに影響のない範囲の誤差は許容」に収まるとして既定化 (ユーザー決定)。GPU_INFER_HALF=0 で fp32。
-        getattr(net, "model", net).half()   # AutoBackend は内部モデルを子モジュールにしないので直接変換する
-        net.fp16 = True
+        net.half()
+    if os.environ.get("GPU_INFER_CHANNELS_LAST", "1") != "0":
+        # channels_last は fp16 の畳み込みが速い (0.77 → 0.66 ms/枚)。conf の差は最大 0.001 (検出一致を確認済み)
+        net = net.to(memory_format=torch.channels_last)
+    if os.environ.get("GPU_INFER_COMPILE", "0") == "1":
+        try:
+            compiled = torch.compile(net, dynamic=False)
+            with torch.no_grad():
+                compiled(dummy.half() if os.environ.get("GPU_INFER_HALF", "1") != "0" else dummy)
+            net = compiled
+        except Exception:
+            pass   # コンパイラが無い環境では eager のまま
     return net
 
 
 # ---------------------------------------------------------------- 復号プロセス側
-def _elev(bgr: np.ndarray) -> np.ndarray:
-    r = bgr[:, :, 2].astype(np.float64); g = bgr[:, :, 1].astype(np.float64); b = bgr[:, :, 0].astype(np.float64)
-    x = r * 65536 + g * 256 + b
-    return np.where(x == 2**23, np.nan, np.where(x > 2**23, (x - 2**24) * 0.01, x * 0.01))
-
-
 def _make_reader(maxsize: int):
     @functools.lru_cache(maxsize=maxsize)
     def read_bgr(path: str):
@@ -89,19 +99,23 @@ def _make_reader(maxsize: int):
     return read_bgr
 
 
+def _invalid_mask(bgr: np.ndarray) -> np.ndarray:
+    """DEM の無効画素 (x = 2^23 = R128,G0,B0)。uint8 のまま判定する (標高への変換はしない)。"""
+    return (bgr[:, :, 2] == 128) & (bgr[:, :, 1] == 0) & (bgr[:, :, 0] == 0)
+
+
 def build_canvas(read_bgr, tiles_dir: str, tx: int, ty: int, bgr: np.ndarray):
-    """DEM 4 枚から 768x768x3 生バイトを bgr に書く。戻り値 (mean, cs, ksize) か None。
-    判定は scanning._gen_3ch_uncached と同じ: 本体の有効画素 30% 未満 / canvas の有効画素 30% 未満 → None。"""
+    """DEM 4 枚の生バイトを 768x768x3 の bgr (共有メモリのスロット) に書く。戻り値 (cs, ksize) か None。
+    None の判定は本体タイルの有効画素 30% 未満だけ。canvas 全体の有効画素と NaN 埋めの平均は GPU 側
+    (gpu3ch.gpu_decode_fill / back) で行う。復号プロセスは標高に変換しない (倍精度配列の往復が
+    32 プロセスでメモリ帯域を食い潰し、復号が律速になっていた)。"""
     main = read_bgr(str(Path(tiles_dir) / "16" / str(tx) / f"{ty}.webp"))
     if main is None:
         return None
-    main_e = _elev(main)
-    if np.count_nonzero(~np.isnan(main_e)) < TILE_PX * TILE_PX * 0.3:
+    if main.shape[0] * main.shape[1] - int(np.count_nonzero(_invalid_mask(main))) < TILE_PX * TILE_PX * 0.3:
         return None
     bgr[:] = NAN_BGR
-    canvas = np.full((EXTENDED_PX, EXTENDED_PX), np.nan)
     bgr[:TILE_PX, :TILE_PX] = main
-    canvas[:TILE_PX, :TILE_PX] = main_e
     for (dx, dy), (sl_y, sl_x), (src_y, src_x) in (
         ((1, 0), (slice(0, TILE_PX), slice(TILE_PX, None)), (slice(None), slice(0, HALF))),
         ((0, 1), (slice(TILE_PX, None), slice(0, TILE_PX)), (slice(0, HALF), slice(None))),
@@ -109,16 +123,10 @@ def build_canvas(read_bgr, tiles_dir: str, tx: int, ty: int, bgr: np.ndarray):
     ):
         nb = read_bgr(str(Path(tiles_dir) / "16" / str(tx + dx) / f"{ty + dy}.webp"))
         if nb is not None:
-            part = nb[src_y, src_x]
-            bgr[sl_y, sl_x] = part
-            canvas[sl_y, sl_x] = _elev(part)
-    valid = np.count_nonzero(~np.isnan(canvas))
-    if valid < TILE_PX * TILE_PX * 0.3:
-        return None
-    mean = float(np.nanmean(canvas)) if valid > 0 else 0.0
+            bgr[sl_y, sl_x] = nb[src_y, src_x]
     lat, _ = pixel_to_latlon(16, tx, ty, EXTENDED_PX / 2, EXTENDED_PX / 2)
     cs = cell_size_m(lat, 16)
-    return mean, cs, ksize_for(cs)
+    return cs, ksize_for(cs)
 
 
 def _attach_shm(name: str, slots: int) -> np.ndarray:
@@ -135,7 +143,7 @@ def _attach_shm(name: str, slots: int) -> np.ndarray:
 
 def decode_worker(tiles_dir: str, shm_name: str, slots: int, task_q, free_q, res_q, lru: int) -> None:
     """task_q: (window_idx, task_id, [(tx, [ty, ...]), ...]) を順に処理し、res_q にタイルごとの結果を流す。
-    結果: (slot, mean, cs, ksize, tx, ty, window_idx, task_id) か (None, tx, ty, window_idx, task_id)。None で終了。
+    結果: (slot, cs, ksize, tx, ty, window_idx, task_id) か (None, tx, ty, window_idx, task_id)。None で終了。
     1 タスクは隣接する数列。同じプロセスが隣の列を続けて処理するので、右隣の列の DEM が LRU に残る。"""
     view = _attach_shm(shm_name, slots)
     read_bgr = _make_reader(lru)
@@ -147,7 +155,7 @@ def decode_worker(tiles_dir: str, shm_name: str, slots: int, task_q, free_q, res
         for tx, tys in cols:
             for ty in tys:
                 main = read_bgr(str(Path(tiles_dir) / "16" / str(tx) / f"{ty}.webp"))
-                if main is None or np.count_nonzero(~np.isnan(_elev(main))) < TILE_PX * TILE_PX * 0.3:
+                if main is None or main.shape[0] * main.shape[1] - int(np.count_nonzero(_invalid_mask(main))) < TILE_PX * TILE_PX * 0.3:
                     res_q.put((None, tx, ty, widx, tid))
                     continue
                 slot = free_q.get()
@@ -156,7 +164,7 @@ def decode_worker(tiles_dir: str, shm_name: str, slots: int, task_q, free_q, res
                     free_q.put(slot)
                     res_q.put((None, tx, ty, widx, tid))
                 else:
-                    res_q.put((slot, r[0], r[1], r[2], tx, ty, widx, tid))
+                    res_q.put((slot, r[0], r[1], tx, ty, widx, tid))
     res_q.put(("done",))
 
 
@@ -199,11 +207,21 @@ def scan_tiles_gpu(
     todo = [(tx, ty) for _, tx, ty in tiles[resume_from:]]
     if not todo:
         return []
+    if progress_save_callback is None:
+        # 進捗保存が無い = レジュームの単位はこの呼び出し全体 (claim-tiles のチャンク)。中の順序は自由なので
+        # 列順に並べ替える。近さ順のままだと隣接 DEM の再利用が効かず、復号の読みが 1 枚あたり 2.7 ファイルになる
+        # (列順なら 1.3)。NAS や R2 から読むときは帯域に直結する
+        todo.sort()
+    # 推論バッチ。呼び出し側の 128 は CPU 経路向けの値。GPU 経路では主スレッドの回数が減る 256 が速いが、
+    # YOLO の活性化メモリが増える (fp16, 768px, 256 枚で約 4GB)。空きメモリで選ぶ (8〜12GB の GPU でも動くように)。
+    free_gib = torch.cuda.mem_get_info()[0] / 2**30
+    batch_size = int(os.environ.get("GPU_INFER_BATCH", "256" if free_gib >= 10 else ("128" if free_gib >= 6 else "64")))
     windows = [todo[i:i + WINDOW] for i in range(0, len(todo), WINDOW)]
 
     def _is_cancelled():
         return cancel_event is not None and cancel_event.is_set()
 
+    torch.set_num_threads(4)   # 主プロセスの CPU 演算は僅か。既定 (コア数) だと OMP のスピンが復号プロセスの CPU を奪う
     ctx = mp.get_context("forkserver")
     slots = _slot_count(int(os.environ.get("GPU_3CH_SLOTS", "1024")))
     shm = shared_memory.SharedMemory(create=True, size=slots * SLOT_BYTES)
@@ -216,7 +234,13 @@ def scan_tiles_gpu(
         view = np.ndarray((slots, EXTENDED_PX, EXTENDED_PX, 3), np.uint8, buffer=shm.buf)
         shm_t = torch.from_numpy(view)
         registered = int(torch.cuda.cudart().cudaHostRegister(shm_t.data_ptr(), shm_t.numel(), 0)) == 0
-        gen = GraphGen(device, GEN_BATCH, shm_t, compiled=os.environ.get("GPU_3CH_COMPILE", "1") != "0")
+        gen = GraphGen(device, GEN_BATCH, shm_t, compiled=os.environ.get("GPU_3CH_COMPILE", "1") != "0", output="infer")
+        # 推論入力のリング 2 面 (生成が片方に書いている間にもう片方を推論する)。channels_last は畳み込みが速い
+        ring_cap = batch_size + GEN_BATCH
+        mf = torch.channels_last if os.environ.get("GPU_INFER_CHANNELS_LAST", "1") != "0" else torch.contiguous_format
+        rings = [torch.empty((ring_cap, 3, EXTENDED_PX, EXTENDED_PX), dtype=torch.float16, device=device).contiguous(memory_format=mf)
+                 for _ in range(2)]
+        ring_i, ring_pos = 0, 0
         ksizes = {ksize_for(cell_size_m(pixel_to_latlon(16, tx, ty, EXTENDED_PX / 2, EXTENDED_PX / 2)[0], 16))
                   for tx, ty in todo}
         gen.prebuild(ksizes)
@@ -296,41 +320,48 @@ def scan_tiles_gpu(
             pending_release = keep_
 
         def flush_bucket(k):
-            nonlocal n_ready
+            nonlocal n_ready, ring_pos
             items = buckets.pop(k, [])
             if not items:
                 return
             tq = time.perf_counter()
-            imgs, keep, ev, h2d = gen(items)
+            if ring_pos + len(items) > batch_size:   # 推論バッチは常に batch_size 以下 (大きいと YOLO の活性化で OOM)
+                flush_inf()
+            dst = rings[ring_i][ring_pos:ring_pos + len(items)]
+            ring_pos += len(items)
+            imgs, keep, ev, h2d = gen(items, dst=dst)
             prof["issue"] += time.perf_counter() - tq; prof["n_gen"] += 1
-            ready.append((imgs, keep, [(it[4], it[5]) for it in items], ev))
+            ready.append((imgs, keep, [(it[3], it[4]) for it in items], ev))
             n_ready += len(items)
             pending_release.append((h2d, [it[0] for it in items]))
 
         def flush_inf():
-            nonlocal n_ready, total_detections
+            """いまの面にある生成済み画像を全部推論する (面は連続領域なので cat しない)。
+            生成対象外 (keep=False) も推論に含めて結果を捨てる。割合が小さく、詰め直すコピーより安い。"""
+            nonlocal n_ready, total_detections, ring_i, ring_pos
             if not ready:
                 return
             tq = time.perf_counter()
-            take, cnt = [], 0
-            while ready and cnt < batch_size:
-                take.append(ready.pop(0))
-                cnt += len(take[-1][2])
-            n_ready -= cnt
+            take = ready[:]
+            ready.clear()
+            n_ready = 0
             cur = torch.cuda.current_stream()
             for r in take:
                 cur.wait_event(r[3])
-            keep = torch.cat([r[1] for r in take])
-            imgs = torch.cat([r[0] for r in take])[keep]
-            kl = keep.tolist()
+            total_n = sum(len(r[2]) for r in take)
+            imgs = rings[ring_i][:total_n]
+            kl = torch.cat([r[1] for r in take]).tolist()
             metas = [m for r in take for m in r[2]]
-            metas = [m for m, kp in zip(metas, kl) if kp]
+            ring_i ^= 1
+            ring_pos = 0
             prof["gather"] += time.perf_counter() - tq
-            if not metas:
+            if not any(kl):
                 return
             tq = time.perf_counter()
             batch_dets = infer_yolo_direct(net, imgs, conf_threshold)
             prof["infer"] += time.perf_counter() - tq; prof["n_inf"] += 1
+            batch_dets = [d for d, kp in zip(batch_dets, kl) if kp]
+            metas = [m for m, kp in zip(metas, kl) if kp]
             for dets, (tx, ty) in zip(batch_dets, metas):
                 for d in dets:
                     rec = resolve_detection(d, tx, ty, z)
@@ -377,10 +408,10 @@ def scan_tiles_gpu(
             if r[0] is None:
                 account(widx, tid)
             else:
-                buckets.setdefault(r[3], []).append(r)
-                if len(buckets[r[3]]) >= GEN_BATCH:
-                    flush_bucket(r[3])
-            if n_ready >= batch_size + GEN_BATCH:
+                buckets.setdefault(r[2], []).append(r)
+                if len(buckets[r[2]]) >= GEN_BATCH:
+                    flush_bucket(r[2])
+            if n_ready + GEN_BATCH > batch_size:
                 flush_inf()
             release_slots()
             # 完了の計上: 生成に回したタイルは推論後ではなく受領時点で数える (旧実装と同じ粒度)
