@@ -1098,7 +1098,9 @@ def handle_scan(job: dict):
             conf_threshold=conf_threshold,
             region=region,
             batch_size=config.get("batch_size", 128),
-            num_workers=config.get("num_workers", 8),
+            # 既定 8 では CPU 生成 (z15 等) でも GPU 経路の復号でも GPU を使い切れなかった (実測 111 → 212 tile/s)。
+            # 小さな Pod で詰まらないよう CPU 数で上限を取る。
+            num_workers=config.get("num_workers", max(4, min(16, os.cpu_count() or 8))),
             progress_callback=on_progress,
             detection_callback=on_detections,
             tile_fetcher=fetch_tile if REMOTE_TILES else None,

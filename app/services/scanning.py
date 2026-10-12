@@ -228,6 +228,15 @@ def _gen_3ch_extended(args: tuple) -> tuple | None:
     return out
 
 
+RESUME_WINDOW = 1024
+
+
+def _gen_3ch_extended_w(args: tuple) -> tuple:
+    """_gen_3ch_extended + ウィンドウ番号。結果が None (生成対象外) でも、どのウィンドウの
+    タイルが終わったかを呼び出し側が数えられるようにする。戻り値 (result | None, window_idx)。"""
+    return _gen_3ch_extended(args[:4]), args[4]
+
+
 def _gen_3ch_uncached(args: tuple) -> tuple | None:
     """3ch 拡張タイルを DEM から実際に生成する (キャッシュを見ない)。
 
@@ -334,6 +343,15 @@ def load_model(model_path: str, device: torch.device | None = None):
     if p.suffix == ".pt" and p.is_file():
         from ultralytics import YOLO
         model = YOLO(str(model_path))
+        # YOLO26 は one2one ヘッドによる NMS なし推論 (end2end) が前提。ultralytics の版によって
+        # 古い checkpoint の既定が変わる (8.4.122: True / 8.4.175: False) ので明示的に有効化する。
+        # False のままだと predict が NMS 経路になり、箱も速度も変わる。
+        head = model.model.model[-1]
+        if hasattr(head, "one2one_cv2") or hasattr(head, "one2one"):
+            try:
+                head.end2end = True
+            except AttributeError:
+                pass
         return model, None, "yolo"
 
     raise ValueError(f"Cannot determine model type for: {model_path}")
@@ -555,31 +573,34 @@ def scan_tiles(
 
     # z=16 / CUDA / YOLO end2end なら 3ch を GPU で生成する実装へ (3ch キャッシュ不要、実測 111 → 413 tile/s)。
     # z=15、RT-DETR、CUDA 無し (Mac の MPS は倍精度非対応) は従来の CPU 生成経路のまま。
-    from app.services.scanning_gpu import gpu_scan_available, scan_tiles_gpu
+    from app.services.scanning_gpu import gpu_scan_available, prepare_direct_model, scan_tiles_gpu
     if gpu_scan_available(model_type, z):
-        try:
+        net = prepare_direct_model(model, conf_threshold, device)
+        if net is None:   # end2end でないモデル (yolo11 など) → 従来経路
+            if progress_callback:
+                progress_callback(resume_from / max(1, len(tiles)), "model is not end2end; CPU 3ch path")
+        else:
             return scan_tiles_gpu(
-                model, tiles_dir, tiles, conf_threshold, batch_size, num_workers,
+                net, tiles_dir, tiles, conf_threshold, batch_size, num_workers,
                 progress_callback, detection_callback, tile_fetcher, resume_from,
                 progress_save_callback, cancel_event, z=z,
             )
-        except ValueError as e:   # end2end でないモデル (yolo11 など) → 従来経路
-            if progress_callback:
-                progress_callback(resume_from / max(1, len(tiles)), f"GPU 3ch unavailable ({e}); CPU path")
 
     # 150%拡張タイル: 各タイルを768×768に拡張（右+256, 下+256, 右下+256×256）
     # 隣接タイルはスキャン対象集合に入っているかで絞らない。絞ると都道府県
     # スキャンの縁で学習側と違う画像になる (_gen_3ch_uncached の docstring 参照)。
-    extended_tiles = [(tiles_dir, tx, ty, z) for _, tx, ty in tiles]
+    # 末尾の要素はウィンドウ番号 (レジューム用。下の account を参照)。_gen_3ch_extended は args[:4] しか見ない。
+    total_tiles = len(tiles)
 
-    total_tiles = len(extended_tiles)
-
-    # レジューム: 処理済みタイルをスキップ
+    # レジューム: 処理済みタイルをスキップ。ウィンドウ番号は残りの並びに対して振る (下の _account 参照)
     if resume_from > 0 and resume_from < total_tiles:
-        extended_tiles = extended_tiles[resume_from:]
         if progress_callback:
             progress_callback(resume_from / total_tiles,
                               f"Resuming from tile {resume_from:,}/{total_tiles:,}")
+    else:
+        resume_from = 0
+    extended_tiles = [(tiles_dir, tx, ty, z, i // RESUME_WINDOW)
+                      for i, (_, tx, ty) in enumerate(tiles[resume_from:])]
     all_detections: list[dict] = []
     total_detections = 0
     processed = 0
@@ -670,7 +691,7 @@ def scan_tiles(
                         continue
                     yield item
 
-            for r in pool.imap_unordered(_gen_3ch_extended, _yield_extended(), chunksize=1):
+            for r in pool.imap_unordered(_gen_3ch_extended_w, _yield_extended(), chunksize=1):
                 if _is_cancelled():
                     break
                 img_queue.put(r)
@@ -681,7 +702,7 @@ def scan_tiles(
             for ci in range(0, len(extended_tiles), CHUNK):
                 if _is_cancelled():
                     break
-                for r in pool.imap_unordered(_gen_3ch_extended, extended_tiles[ci:ci+CHUNK], chunksize=16):
+                for r in pool.imap_unordered(_gen_3ch_extended_w, extended_tiles[ci:ci+CHUNK], chunksize=16):
                     if _is_cancelled():
                         break
                     img_queue.put(r)
@@ -694,7 +715,30 @@ def scan_tiles(
         producer.start()
 
         imgs_batch: list[np.ndarray] = []
-        metas_batch: list[tuple[int, int]] = []  # (tx, ty)
+        metas_batch: list[tuple[int, int, int]] = []  # (tx, ty, window_idx)
+
+        # レジュームの正しさ: 以前は「受け取った枚数」が 10,000 の倍数になった時点の枚数を保存していたが、
+        # 結果は順不同 (imap_unordered) かつ推論前に数えていたので、保存位置より前に未処理のタイルが
+        # 残り得た (再開時に飛ばされる)。ここでは RESUME_WINDOW 枚のウィンドウごとに「推論まで終わった」
+        # 枚数を数え、先頭から連続して完了したウィンドウの末尾だけを保存する。
+        n_windows = (len(extended_tiles) + RESUME_WINDOW - 1) // RESUME_WINDOW
+        win_left = [RESUME_WINDOW] * n_windows
+        if n_windows:
+            win_left[-1] = len(extended_tiles) - RESUME_WINDOW * (n_windows - 1)
+        done_prefix = 0
+        saved_at = resume_from
+
+        def _account(widx: int):
+            nonlocal done_prefix, saved_at
+            win_left[widx] -= 1
+            if widx != done_prefix:
+                return
+            while done_prefix < n_windows and win_left[done_prefix] == 0:
+                done_prefix += 1
+            abs_done = resume_from + min(done_prefix * RESUME_WINDOW, len(extended_tiles))
+            if progress_save_callback and abs_done - saved_at >= 10000:
+                progress_save_callback(abs_done)
+                saved_at = abs_done
 
         def _process_batch():
             nonlocal all_detections, total_detections
@@ -703,13 +747,14 @@ def scan_tiles(
             else:
                 batch_dets = _infer_yolo(model, imgs_batch, conf_threshold, device,
                                          imgsz=EXTENDED_PX)
-            for dets, (tx, ty) in zip(batch_dets, metas_batch):
+            for dets, (tx, ty, widx) in zip(batch_dets, metas_batch):
                 for d in dets:
                     # 境界の対象は複数タイルの視野で検出され、サーバー側 dedup が
                     # 最良の 1 件を残す (resolve_detection の docstring 参照)
                     rec = resolve_detection(d, tx, ty, z)
                     if rec is not None:
                         all_detections.append(rec)
+                _account(widx)
 
         while True:
             if _is_cancelled():
@@ -719,9 +764,12 @@ def scan_tiles(
             if item is sentinel:
                 break
             processed += 1
-            if item is not None:
-                imgs_batch.append(item[0])
-                metas_batch.append((item[1], item[2]))
+            result, widx = item
+            if result is None:
+                _account(widx)
+            else:
+                imgs_batch.append(result[0])
+                metas_batch.append((result[1], result[2], widx))
 
             if len(imgs_batch) >= batch_size:
                 _process_batch()
@@ -743,8 +791,6 @@ def scan_tiles(
                     f"{abs_processed:,}/{total_tiles:,} tiles, "
                     f"{det_count:,} detections ({rate:.0f} t/s)",
                 )
-                if progress_save_callback and processed % 10000 < 1:
-                    progress_save_callback(abs_processed)
 
         producer.join()
 

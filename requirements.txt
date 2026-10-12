@@ -4,4 +4,8 @@ opencv-python-headless>=4.10
 Pillow>=10.0
 requests>=2.32
 # ML — AGPL-3.0
-ultralytics>=8.0
+# 版を固定する。8.4.175 では predict が (nms 引数未指定だと) end2end を False に上書きし、
+# 古い checkpoint の推論が NMS 経路に変わって箱も速度も変わった (2026-10-12 の CI ビルドで発覚)。
+# 8.4.122 は 2026-08 以降の本番イメージが使ってきた版。上げるときは tests/test_gpu3ch.py を通し、
+# 同じタイル列で検出結果を旧版と比較すること。
+ultralytics==8.4.122

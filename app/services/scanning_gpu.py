@@ -49,6 +49,22 @@ def gpu_scan_available(model_type: str, z: int) -> bool:
     return model_type == "yolo" and z == 16 and torch.cuda.is_available()
 
 
+def prepare_direct_model(model, conf_threshold: float, device):
+    """predictor を初期化して end2end (NMS-free) の生モデルを返す。end2end でなければ None。
+    判定をここで済ませ、scan_tiles_gpu の中では例外を握りつぶさない (途中の失敗を CPU 経路で
+    黙ってやり直すと、遅くなった理由が見えなくなる)。"""
+    dummy = torch.zeros((1, 3, EXTENDED_PX, EXTENDED_PX), dtype=torch.float32, device=device)
+    model.predict(dummy, conf=conf_threshold, iou=0.5, device=device, imgsz=EXTENDED_PX, verbose=False)
+    net = model.predictor.model
+    with torch.no_grad():
+        preds = net(dummy)
+    if isinstance(preds, (list, tuple)):
+        preds = preds[0]
+    if preds.ndim != 3 or preds.shape[-1] != 6:
+        return None
+    return net
+
+
 # ---------------------------------------------------------------- 復号プロセス側
 def _elev(bgr: np.ndarray) -> np.ndarray:
     r = bgr[:, :, 2].astype(np.float64); g = bgr[:, :, 1].astype(np.float64); b = bgr[:, :, 0].astype(np.float64)
@@ -157,7 +173,7 @@ def _slot_count(requested: int) -> int:
 
 # ---------------------------------------------------------------- 本体
 def scan_tiles_gpu(
-    model,
+    net,
     tiles_dir: str,
     tiles: list[tuple[str, int, int]],
     conf_threshold: float,
@@ -181,13 +197,6 @@ def scan_tiles_gpu(
 
     def _is_cancelled():
         return cancel_event is not None and cancel_event.is_set()
-
-    # predictor を一度作り、end2end の生モデルを取り出す
-    dummy = torch.zeros((1, EXTENDED_PX, EXTENDED_PX, 3), dtype=torch.uint8, device=device)
-    model.predict(dummy.permute(0, 3, 1, 2).float(), conf=conf_threshold, iou=0.5, device=device,
-                  imgsz=EXTENDED_PX, verbose=False)
-    net = model.predictor.model
-    del dummy
 
     ctx = mp.get_context("forkserver")
     slots = _slot_count(int(os.environ.get("GPU_3CH_SLOTS", "1024")))
@@ -266,6 +275,8 @@ def scan_tiles_gpu(
         processed = 0
         workers_done = 0
         t0 = time.monotonic()
+        prof = {"wait": 0.0, "issue": 0.0, "gather": 0.0, "infer": 0.0, "n_gen": 0, "n_inf": 0}
+        profiling = os.environ.get("GPU_3CH_PROFILE", "0") == "1"
 
         def release_slots():
             nonlocal pending_release
@@ -283,7 +294,9 @@ def scan_tiles_gpu(
             items = buckets.pop(k, [])
             if not items:
                 return
+            tq = time.perf_counter()
             imgs, keep, ev, h2d = gen(items)
+            prof["issue"] += time.perf_counter() - tq; prof["n_gen"] += 1
             ready.append((imgs, keep, [(it[4], it[5]) for it in items], ev))
             n_ready += len(items)
             pending_release.append((h2d, [it[0] for it in items]))
@@ -292,6 +305,7 @@ def scan_tiles_gpu(
             nonlocal n_ready, total_detections
             if not ready:
                 return
+            tq = time.perf_counter()
             take, cnt = [], 0
             while ready and cnt < batch_size:
                 take.append(ready.pop(0))
@@ -305,9 +319,12 @@ def scan_tiles_gpu(
             kl = keep.tolist()
             metas = [m for r in take for m in r[2]]
             metas = [m for m, kp in zip(metas, kl) if kp]
+            prof["gather"] += time.perf_counter() - tq
             if not metas:
                 return
+            tq = time.perf_counter()
             batch_dets = infer_yolo_direct(net, imgs, conf_threshold)
+            prof["infer"] += time.perf_counter() - tq; prof["n_inf"] += 1
             for dets, (tx, ty) in zip(batch_dets, metas):
                 for d in dets:
                     rec = resolve_detection(d, tx, ty, z)
@@ -338,11 +355,14 @@ def scan_tiles_gpu(
         while workers_done < len(procs):
             if _is_cancelled():
                 break
+            tq = time.perf_counter()
             try:
                 r = res_q.get(timeout=0.5)
             except queue.Empty:
+                prof["wait"] += time.perf_counter() - tq
                 release_slots()
                 continue
+            prof["wait"] += time.perf_counter() - tq
             if r[0] == "done":
                 workers_done += 1
                 continue
@@ -375,6 +395,11 @@ def scan_tiles_gpu(
             torch.cuda.synchronize()
             if progress_save_callback:
                 progress_save_callback(resume_from + processed)
+            if profiling and progress_callback and processed:
+                per = 1000 / processed
+                progress_callback(1.0, "profile ms/tile: wait-for-decoders %.2f | gen-issue %.2f | gather %.2f | infer %.2f | wall %.2f (gen calls %d, infer calls %d)" % (
+                    prof["wait"] * per, prof["issue"] * per, prof["gather"] * per, prof["infer"] * per,
+                    (time.monotonic() - t0) * per, prof["n_gen"], prof["n_inf"]))
     finally:
         stop.set()
         for p in procs:
