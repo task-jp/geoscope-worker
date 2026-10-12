@@ -15,7 +15,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    # TensorRT の builder リソースは GPU 世代別に 250〜650MB ずつ入っている。Windows 用 (_win_) と
+    # 使わない世代 (sm90=H100, sm100=B200) を外して約 3.6GB 減らす。残すのは sm80 (A100)、sm89 (4090)、
+    # sm120 (RTX 50 系)、ptx (それ以外の世代の汎用)。別の GPU を使うときはここを見直すこと
+    && cd /opt/conda/lib/python3.11/site-packages/tensorrt_libs \
+    && rm -f libnvinfer_builder_resource_win_*.so.* libnvinfer_builder_resource_sm90.so.* libnvinfer_builder_resource_sm100.so.* \
+    && ls -la libnvinfer_builder_resource_* | awk '{print $5, $9}'
 
 COPY worker.py .
 COPY app ./app

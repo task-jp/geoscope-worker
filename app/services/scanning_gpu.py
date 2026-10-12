@@ -83,12 +83,32 @@ TRT_BATCH = 128   # engine は固定バッチ。推論バッチもこれに合�
 
 
 class _TRTModel(torch.nn.Module):
-    """TensorRT engine を infer_yolo_direct から呼べる形にする。入力は float32 NCHW 連続、固定バッチ。"""
+    """TensorRT engine を infer_yolo_direct から呼べる形にする。入力は float32 NCHW 連続、固定バッチ。
+    ultralytics の TensorRT backend は使わない: execute_v2 (同期・レガシー既定ストリーム) で 3ch 生成と
+    直列化されるのと、export が nvidia-modelopt / onnxruntime を実行時に pip で自動インストールしようとして
+    数分止まるため。engine は自前で (ONNX → TensorRT builder、FP16 フラグ) 作る。"""
 
-    def __init__(self, backend, device):
+    def __init__(self, engine_path: Path, device):
         super().__init__()
-        self.backend = backend
+        import tensorrt as trt
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        self.runtime = trt.Runtime(self.logger)
+        self.engine = self.runtime.deserialize_cuda_engine(engine_path.read_bytes())
+        if self.engine is None:
+            raise RuntimeError(f"TensorRT engine を読めない: {engine_path}")
+        self.context = self.engine.create_execution_context()
+        names = [self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors)]
+        self.in_name = next(n for n in names if self.engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT)
+        self.out_name = next(n for n in names if self.engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT)
+        _dt = {trt.float16: torch.float16, trt.float32: torch.float32}
+        self.in_dtype = _dt[self.engine.get_tensor_dtype(self.in_name)]
+        out_shape = tuple(self.engine.get_tensor_shape(self.out_name))
+        if len(out_shape) != 3 or out_shape[-1] != 6:
+            raise RuntimeError(f"end2end の出力 (B,300,6) を想定: {out_shape}")
+        self.out = torch.empty(out_shape, dtype=_dt[self.engine.get_tensor_dtype(self.out_name)], device=device)
+        self.context.set_tensor_address(self.out_name, int(self.out.data_ptr()))
         self.marker = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16, device=device), requires_grad=False)  # _is_half → True
+        self._keep_alive = None
 
     def forward(self, b):
         n = b.shape[0]
@@ -96,57 +116,83 @@ class _TRTModel(torch.nn.Module):
             raise ValueError(f"TensorRT batch {n} > {TRT_BATCH}")
         if n < TRT_BATCH:
             b = torch.cat([b, b[:1].expand(TRT_BATCH - n, -1, -1, -1)])
-        # 前回の入力は使い終わっている (execute_async_v3 の後に .cpu() で同期している) ので 1 面だけ持つ
-        x = b.float().contiguous()
         self._keep_alive = None
-        # ultralytics の backend は execute_v2 (同期・レガシー既定ストリーム) で、3ch 生成のストリームと直列化され
-        # 生成バッチが 24 → 65 ms になった (実測)。torch の現在ストリームで非同期に実行して並行性を保つ。
-        # 入力 x は enqueue 後も参照を保つ必要がある (ストリーム順で読み終わるまで解放されないよう self に置く)
-        ctx = self.backend.context
-        ctx.set_tensor_address("images", int(x.data_ptr()))
-        out_name = sorted(self.backend.output_names)[0]
-        out = self.backend.bindings[out_name].data
-        ctx.set_tensor_address(out_name, int(out.data_ptr()))
-        if not ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream):
+        x = b.to(self.in_dtype).contiguous()   # ONNX を fp16 で書き出しているので通常は fp16 のまま (コピー無し)
+        self.context.set_tensor_address(self.in_name, int(x.data_ptr()))
+        # torch の現在ストリームで非同期に実行。呼び出し側は結果を .cpu() するので、それが同期点になる
+        if not self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream):
             raise RuntimeError("TensorRT execute_async_v3 failed")
-        self._keep_alive = x
-        return out[:n]
+        self._keep_alive = x    # 実行が終わるまで入力を解放しない
+        return self.out[:n]
+
+
+def _build_trt_engine(pt: Path, eng: Path, device, progress=None) -> None:
+    """学習済み .pt → ONNX (ultralytics) → TensorRT engine (FP16、固定バッチ)。1〜2 分。"""
+    import tensorrt as trt
+    from ultralytics import YOLO
+    t0 = time.monotonic()
+    if progress:
+        progress(0.0, "TensorRT engine を構築中 (1〜2 分、初回のみ)")
+    # TensorRT 11 では精度フラグ (FP16) が無く、ネットワークの型は ONNX の dtype で決まる (strongly typed)。
+    # PyTorch の half() と同じ重みで fp16 の ONNX を書き出す → engine の入出力も fp16
+    onnx_path = Path(YOLO(str(pt)).export(format="onnx", imgsz=EXTENDED_PX, batch=TRT_BATCH, dynamic=False,
+                                           half=True, simplify=True, opset=17, device=device.index or 0, verbose=False))
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
+    parser = trt.OnnxParser(network, logger)
+    if not parser.parse(onnx_path.read_bytes()):
+        errs = "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors))
+        raise RuntimeError(f"ONNX parse failed: {errs}")
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)
+    serialized = builder.build_serialized_network(network, config)
+    if serialized is None:
+        raise RuntimeError("TensorRT build failed")
+    tmp = eng.with_suffix(".tmp")
+    tmp.write_bytes(bytes(serialized))
+    tmp.rename(eng)
+    if progress:
+        progress(0.0, f"TensorRT engine 構築 {time.monotonic() - t0:.0f} 秒")
+
+
+_TRT_CACHE: dict[str, "_TRTModel"] = {}   # engine パス → 読み込み済み。チャンクごとに作り直すと GPU メモリが増え続けて OOM になった (実測)
 
 
 def _try_tensorrt(model, device, progress=None):
-    """学習済み .pt から TensorRT fp16 engine を作って (無ければ)、読み込む。失敗したら None (eager fp16 のまま)。
-    engine は GPU 機種ごとに違うので、同じディレクトリに <stem>.b128.i768.engine として置き、再利用する。
-    export には 1〜2 分かかる。"""
+    """学習済み .pt の横の <stem>.b128.i768.engine を読む (無ければ作る)。失敗したら None (eager fp16 のまま)。
+    engine は GPU 機種ごとに違うので、同じ GPU でだけ再利用される前提 (Pod は毎回作る、ローカルは残る)。"""
     try:
         import tensorrt  # noqa: F401
     except Exception:
         return None
     try:
-        from ultralytics import YOLO
         pt = Path(model.ckpt_path if getattr(model, "ckpt_path", None) else model.overrides.get("model", ""))
         if not pt.exists():
             return None
         eng = pt.with_name(f"{pt.stem}.b{TRT_BATCH}.i{EXTENDED_PX}.engine")
+        key = str(eng.resolve())
+        if key in _TRT_CACHE:
+            return _TRT_CACHE[key]
         if not eng.exists():
-            if progress:
-                progress(0.0, "TensorRT engine を構築中 (1〜2 分、初回のみ)")
-            t0 = time.monotonic()
-            out = YOLO(str(pt)).export(format="engine", half=True, imgsz=EXTENDED_PX, batch=TRT_BATCH,
-                                       dynamic=False, device=device.index or 0, verbose=False, workspace=4)
-            Path(out).rename(eng)
-            if progress:
-                progress(0.0, f"TensorRT engine 構築 {time.monotonic() - t0:.0f} 秒")
-        m = YOLO(str(eng), task="detect")
-        dummy = torch.zeros((TRT_BATCH, 3, EXTENDED_PX, EXTENDED_PX), device=device)
-        m.predict(dummy, imgsz=EXTENDED_PX, device=device.index or 0, verbose=False, half=True, batch=TRT_BATCH)
-        return _TRTModel(m.predictor.model, device)
+            _build_trt_engine(pt, eng, device, progress)
+        _TRT_CACHE.clear()      # 別モデルに切り替わったら前のものは手放す (実行コンテキスト約 3GB)
+        try:
+            m = _TRTModel(eng, device)
+        except RuntimeError:
+            # 古い形式 (ultralytics のメタデータ付き) や別版で作った engine は読めない → 作り直す
+            eng.unlink(missing_ok=True)
+            _build_trt_engine(pt, eng, device, progress)
+            m = _TRTModel(eng, device)
+        _TRT_CACHE[key] = m
+        return m
     except Exception as e:   # engine が作れない GPU/環境では eager に戻る
         if progress:
-            progress(0.0, f"TensorRT unavailable ({type(e).__name__}); eager fp16")
+            progress(0.0, f"TensorRT unavailable ({type(e).__name__}: {str(e)[:120]}); eager fp16")
+        print(f"[scanning_gpu] TensorRT unavailable: {type(e).__name__}: {e}", flush=True)
         return None
 
 
-# ---------------------------------------------------------------- 復号プロセス側
 def _make_reader(maxsize: int):
     @functools.lru_cache(maxsize=maxsize)
     def read_bgr(path: str):
@@ -284,34 +330,45 @@ def scan_tiles_gpu(
     torch.set_num_threads(4)   # 主プロセスの CPU 演算は僅か。既定 (コア数) だと OMP のスピンが復号プロセスの CPU を奪う
     ctx = mp.get_context("forkserver")
     slots = _slot_count(int(os.environ.get("GPU_3CH_SLOTS", "1024")))
-    shm = shared_memory.SharedMemory(create=True, size=slots * SLOT_BYTES)
     procs: list = []
     feeder: threading.Thread | None = None
     stop = threading.Event()
     all_detections: list[dict] = []
     total_detections = 0
-    try:
+    # 共有メモリ・ピン止め・CUDA Graph はプロセス内で使い回す。_scan_multi は 50,000 枚の claim チャンクごとに
+    # scan_tiles を呼ぶので、毎回作ると起動に 5 秒かかるうえ、TensorRT と併用すると GPU メモリが積み上がって
+    # 2 チャンク目で OOM になった (実測)
+    pst = _PERSIST
+    if pst.get("slots") != slots:
+        _release_persistent()
+        shm = shared_memory.SharedMemory(create=True, size=slots * SLOT_BYTES)
         view = np.ndarray((slots, EXTENDED_PX, EXTENDED_PX, 3), np.uint8, buffer=shm.buf)
         shm_t = torch.from_numpy(view)
         # 共有メモリをピン止め (DMA 可能に) する。失敗すると H2D が同期コピーになり、生成バッチが 12 → 33 ms に
         # 落ちる (実測)。GPU メモリをたくさん使った後 (TensorRT のコンテキスト等) だと失敗することがあるので、
         # TensorRT の初期化より先に行う
         rc = int(torch.cuda.cudart().cudaHostRegister(shm_t.data_ptr(), shm_t.numel(), 0))
-        registered = rc == 0
-        if not registered:
+        if rc != 0:
             print(f"[scanning_gpu] cudaHostRegister failed (rc={rc}); host→GPU copies will be slow", flush=True)
+        pst.update(slots=slots, shm=shm, shm_t=shm_t, registered=rc == 0, gen=None)
+    shm, shm_t = pst["shm"], pst["shm_t"]
+    try:
         if os.environ.get("GPU_INFER_TRT", "1") != "0":
             trt = _try_tensorrt(model, device, progress_callback)
             if trt is not None:
                 net = trt
                 batch_size = TRT_BATCH   # engine の固定バッチに合わせる (リングもこの値で作る)
-        gen = GraphGen(device, GEN_BATCH, shm_t, compiled=os.environ.get("GPU_3CH_COMPILE", "1") != "0", output="infer")
+        if pst.get("gen") is None:
+            pst["gen"] = GraphGen(device, GEN_BATCH, shm_t, compiled=os.environ.get("GPU_3CH_COMPILE", "1") != "0", output="infer")
+        gen = pst["gen"]
         # 推論入力のリング 2 面 (生成が片方に書いている間にもう片方を推論する)。channels_last は畳み込みが速い
         ring_cap = batch_size + GEN_BATCH
         mf = torch.channels_last if os.environ.get("GPU_INFER_CHANNELS_LAST", "1") != "0" else torch.contiguous_format
         rings = [torch.empty((ring_cap, 3, EXTENDED_PX, EXTENDED_PX), dtype=torch.float16, device=device).contiguous(memory_format=mf)
                  for _ in range(2)]
         ring_i, ring_pos = 0, 0
+        # 推論は専用ストリームで。既定ストリームだと TensorRT が enqueueV3 のたびに cudaStreamSynchronize を足す (警告が出る)
+        inf_stream = torch.cuda.Stream()
         ksizes = {ksize_for(cell_size_m(pixel_to_latlon(16, tx, ty, EXTENDED_PX / 2, EXTENDED_PX / 2)[0], 16))
                   for tx, ty in todo}
         gen.prebuild(ksizes)
@@ -420,7 +477,7 @@ def scan_tiles_gpu(
             take = ready[:]
             ready.clear()
             n_ready = 0
-            cur = torch.cuda.current_stream()
+            cur = inf_stream
             for r in take:
                 cur.wait_event(r[3])
             if profiling:
@@ -430,7 +487,8 @@ def scan_tiles_gpu(
                     prof["gen_age_ms"] = prof.get("gen_age_ms", 0.0) + (time.perf_counter() - r[5]) * 1000
             total_n = sum(len(r[2]) for r in take)
             imgs = rings[ring_i][:total_n]
-            kl = torch.cat([r[1] for r in take]).tolist()
+            with torch.cuda.stream(inf_stream):
+                kl = torch.cat([r[1] for r in take]).tolist()
             metas = [m for r in take for m in r[2]]
             ring_i ^= 1
             ring_pos = 0
@@ -438,11 +496,12 @@ def scan_tiles_gpu(
             if not any(kl):
                 return
             tq = time.perf_counter()
-            if profiling and len(timeline) < 60:
-                e0 = torch.cuda.Event(enable_timing=True); e0.record()
-            batch_dets = infer_yolo_direct(net, imgs, conf_threshold)
-            if profiling and len(timeline) < 60:
-                e1 = torch.cuda.Event(enable_timing=True); e1.record(); timeline.append(("inf", e0, e1))
+            with torch.cuda.stream(inf_stream):
+                if profiling and len(timeline) < 60:
+                    e0 = torch.cuda.Event(enable_timing=True); e0.record()
+                batch_dets = infer_yolo_direct(net, imgs, conf_threshold)   # 中の .cpu() が inf_stream の同期点
+                if profiling and len(timeline) < 60:
+                    e1 = torch.cuda.Event(enable_timing=True); e1.record(); timeline.append(("inf", e0, e1))
             prof["infer"] += time.perf_counter() - tq; prof["n_inf"] += 1
             batch_dets = [d for d, kp in zip(batch_dets, kl) if kp]
             metas = [m for m, kp in zip(metas, kl) if kp]
@@ -537,11 +596,29 @@ def scan_tiles_gpu(
             p.join(timeout=5)
         if feeder is not None:
             feeder.join(timeout=5)
-        try:
-            if registered:
-                torch.cuda.cudart().cudaHostUnregister(shm_t.data_ptr())
-        except Exception:
-            pass
-        shm.close()
-        shm.unlink()
     return all_detections
+
+
+_PERSIST: dict = {}
+
+
+def _release_persistent() -> None:
+    """共有メモリと Graph を手放す (スロット数が変わったときと、プロセス終了時)。"""
+    pst = _PERSIST
+    if not pst:
+        return
+    try:
+        if pst.get("registered"):
+            torch.cuda.cudart().cudaHostUnregister(pst["shm_t"].data_ptr())
+    except Exception:
+        pass
+    try:
+        pst["shm"].close()
+        pst["shm"].unlink()
+    except Exception:
+        pass
+    pst.clear()
+
+
+import atexit
+atexit.register(_release_persistent)

@@ -5,6 +5,7 @@ CPU 版 (visualization.dem_to_3ch + scanning._gen_3ch_uncached の判定) と GP
 GPU が無い環境では GPU のテストはスキップし、純粋な Python/CPU のテストだけ走る。
 """
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -123,3 +124,27 @@ def test_fp32_path_close_to_fp64():
     d = (img32.to(torch.int16) - img64.to(torch.int16)).abs()
     assert int(d.max()) <= 1 and float((d > 0).float().mean()) < 1e-3
     assert bool(keep32[0]) == bool(keep64[0])
+
+
+@cuda
+def test_tensorrt_matches_eager(tmp_path):
+    """自前ビルドの TensorRT engine (FP16) が eager fp16 と同じ検出を返す (tensorrt が無ければスキップ)。"""
+    import shutil
+    pytest.importorskip("tensorrt")
+    from app.services import scanning_gpu
+    from app.services.scanning import load_model
+    dev = torch.device("cuda")
+    pt = tmp_path / "yolo26n.pt"
+    shutil.copy2(Path(__file__).resolve().parents[1] / "yolo26n.pt", pt)
+    model, _, _ = load_model(str(pt), dev)
+    eager = scanning_gpu.prepare_direct_model(model, 0.3, dev)
+    trt = scanning_gpu._try_tensorrt(model, dev)
+    assert trt is not None
+    rng = np.random.default_rng(0)
+    imgs = torch.from_numpy(rng.integers(0, 255, (8, 768, 768, 3), dtype=np.uint8)).to(dev)
+    a = gpu3ch.infer_yolo_direct(eager, imgs, 0.05)
+    b = gpu3ch.infer_yolo_direct(trt, imgs, 0.05)
+    assert len(a) == len(b) == 8
+    # 乱数画像でも検出 (低 conf) が出る。箱の数とおおよその conf が一致すること
+    na, nb = sum(len(x) for x in a), sum(len(x) for x in b)
+    assert abs(na - nb) <= max(2, na // 10)

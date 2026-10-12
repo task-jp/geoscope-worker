@@ -14,3 +14,5 @@ ultralytics==8.4.122
 tensorrt-cu12==11.4.0.106
 onnx==1.23.2
 onnxslim==0.1.98
+# ultralytics の engine export は onnxruntime を要求し、無いと実行時に pip で自動インストールしようとして止まる
+onnxruntime-gpu==1.31.0
