@@ -14,6 +14,7 @@ import os
 import random
 import signal
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -74,13 +75,25 @@ def api_get(path: str) -> dict | list | None:
     return _api_call("GET", path)
 
 
+_tls = threading.local()
+
+
+def _session() -> requests.Session:
+    """スレッドごとに HTTP 接続を使い回す。requests.put などを直接呼ぶと毎回 TLS 接続から張り直し、
+    1 回 0.4〜0.75 秒かかった (2026-10-12 実測)。Session はスレッド間で共有しない。"""
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = _tls.session = requests.Session()
+    return s
+
+
 def _api_call(method: str, path: str, body: dict | None = None, timeout: int = 120) -> dict:
     """HTTP request with retry on transient errors (5xx, connection)."""
     import time as _time
     for attempt in range(4):
         try:
-            fn = requests.put if method == "PUT" else requests.post if method == "POST" else requests.get
-            resp = fn(f"{SERVER_URL}{path}", headers=_headers(), json=body, timeout=timeout, verify=_VERIFY_SSL)
+            resp = _session().request(method, f"{SERVER_URL}{path}", headers=_headers(), json=body,
+                                      timeout=timeout, verify=_VERIFY_SSL)
             resp.raise_for_status()
             return resp.json()
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
@@ -424,6 +437,49 @@ class JobCancelled(Exception):
 class JobAlreadyDone(Exception):
     """パラレルスキャン: 他ワーカーが先に完了済み"""
     pass
+
+
+class _AsyncProgress:
+    """進捗の送信をスキャンのスレッドから外す。送信は 1 本のスレッドで行い、溜まった分は最新の値だけ送る。
+
+    scan_tiles は 1,000 枚ごとに進捗を呼ぶ。これをスキャンのスレッドで同期送信すると 1 回 0.4 秒前後止まり、
+    1,000 枚の処理 (GPU 経路で約 0.75 秒) と同じくらい待つので、全国スキャンの速度が半分近くに落ちていた
+    (2026-10-12 実測)。キャンセルは包む側の関数が cancel_event を set するので、別スレッドからでも効く。"""
+
+    def __init__(self, fn):
+        self._fn = fn
+        self._cv = threading.Condition()
+        self._latest = None
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True, name="progress")
+        self._thread.start()
+
+    def __call__(self, *args) -> None:
+        with self._cv:
+            self._latest = args
+            self._cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while self._latest is None and not self._closed:
+                    self._cv.wait()
+                if self._latest is None:
+                    return
+                item, self._latest = self._latest, None
+            try:
+                self._fn(*item)
+            except (JobCancelled, JobAlreadyDone):
+                pass   # 包む側が cancel_event を set 済み
+            except Exception as e:
+                print(f"[WARN] progress update failed: {e}")
+
+    def close(self) -> None:
+        """残っている最新の値を送ってから止める。"""
+        with self._cv:
+            self._closed = True
+            self._cv.notify()
+        self._thread.join(timeout=60)
 
 
 def update_progress(job_id: str, progress: float, message: str):
@@ -1091,6 +1147,7 @@ def handle_scan(job: dict):
         _post_annotations_async(project_id, annots, prefecture, scan_label)
         total_uploaded += len(annots)
 
+    progress = _AsyncProgress(on_progress)
     try:
         detections = scan_tiles(
             model_path=model_path,
@@ -1101,13 +1158,14 @@ def handle_scan(job: dict):
             # 既定 8 では CPU 生成 (z15 等) でも GPU 経路の復号でも GPU を使い切れなかった (実測 111 → 212 tile/s)。
             # 小さな Pod で詰まらないよう CPU 数で上限を取る。
             num_workers=config.get("num_workers", max(4, min(16, os.cpu_count() or 8))),
-            progress_callback=on_progress,
+            progress_callback=progress,
             detection_callback=on_detections,
             tile_fetcher=fetch_tile if REMOTE_TILES else None,
             tile_set=pref_tiles,
             cancel_event=_cancel_event,
         )
     finally:
+        progress.close()
         _unregister_cancel_event(_cancel_event)
 
     # 残りがあればアップロード
@@ -1620,16 +1678,21 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
     _chunk_count = [0]
 
     def on_progress(p: float, msg: str):
-        # チャンク内進捗を全体進捗に変換
+        # チャンク内進捗を全体進捗に変換する。スキャンのスレッドで呼ばれるので、ここで値を確定させてから
+        # 送信だけを別スレッドに渡す (送信時に _chunk_start を読むと、次のチャンクの開始位置と混ざる)
         global_done = _chunk_start[0] + int(p * _chunk_count[0])
         global_p = global_done / total_tiles if total_tiles > 0 else p
-        progress = 0.20 + global_p * 0.80
         rate_part = ""
         if "t/s)" in msg:
             rate_part = " (" + msg.split("(")[-1]
+        msgs = {info["project_id"]: f"{global_done:,}/{total_tiles:,} tiles, {upload_counts[info['project_id']]:,} detections{rate_part}"
+                for info in class_map.values()}
+        progress(0.20 + global_p * 0.80, msgs)
+
+    def _send_progress(progress: float, msgs: dict):
         for info in class_map.values():
             pid = info["project_id"]
-            det_msg = f"{global_done:,}/{total_tiles:,} tiles, {upload_counts[pid]:,} detections{rate_part}"
+            det_msg = msgs[pid]
             for jid in info["job_ids"]:
                 try:
                     update_progress(jid, progress, det_msg)
@@ -1751,43 +1814,46 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
 
     # claim-tilesでタイルを分担スキャン（スタンドアロンワーカーと並列動作）
     CLAIM_SIZE = 50000
-    while True:
-        # 全ジョブのcursorを同時に進める（どのジョブに参加しても同じ範囲が返る）
-        chunks = []
-        for jid in job_ids:
-            try:
-                c = _api_call("POST", f"/api/worker/jobs/{jid}/claim-tiles",
-                              body={"count": CLAIM_SIZE}, timeout=30)
-                chunks.append(c)
-            except Exception:
-                pass
-        if not chunks or chunks[0].get("count", 0) == 0:
-            break
+    progress = _AsyncProgress(_send_progress)   # 進捗送信でスキャンを止めない
+    try:
+        while True:
+            # 全ジョブのcursorを同時に進める（どのジョブに参加しても同じ範囲が返る）
+            chunks = []
+            for jid in job_ids:
+                try:
+                    c = _api_call("POST", f"/api/worker/jobs/{jid}/claim-tiles",
+                                  body={"count": CLAIM_SIZE}, timeout=30)
+                    chunks.append(c)
+                except Exception:
+                    pass
+            if not chunks or chunks[0].get("count", 0) == 0:
+                break
 
-        start_idx = chunks[0]["start"]
-        count = chunks[0]["count"]
-        _chunk_start[0] = start_idx
-        _chunk_count[0] = count
-        my_tiles = all_tiles[start_idx:start_idx + count]
+            start_idx = chunks[0]["start"]
+            count = chunks[0]["count"]
+            _chunk_start[0] = start_idx
+            _chunk_count[0] = count
+            my_tiles = all_tiles[start_idx:start_idx + count]
 
-        if not my_tiles:
-            print(f"  Warning: empty tile slice [{start_idx}:{start_idx+count}] (all_tiles={len(all_tiles)}), skipping chunk")
-            continue
+            if not my_tiles:
+                print(f"  Warning: empty tile slice [{start_idx}:{start_idx+count}] (all_tiles={len(all_tiles)}), skipping chunk")
+                continue
 
-        scan_tiles(
-            model_path=model_path,
-            tiles_dir=TILES_DIR,
-            conf_threshold=min_conf,
-            batch_size=128,
-            num_workers=32,
-            progress_callback=on_progress,
-            detection_callback=on_detections,
-            tile_fetcher=fetch_tile if REMOTE_TILES else None,
-            tile_list=my_tiles,
-            cancel_event=_cancel_event,
-            z=z_scan,
-        )
-
+            scan_tiles(
+                model_path=model_path,
+                tiles_dir=TILES_DIR,
+                conf_threshold=min_conf,
+                batch_size=128,
+                num_workers=32,
+                progress_callback=on_progress,
+                detection_callback=on_detections,
+                tile_fetcher=fetch_tile if REMOTE_TILES else None,
+                tile_list=my_tiles,
+                cancel_event=_cancel_event,
+                z=z_scan,
+            )
+    finally:
+        progress.close()
     _flush_uploads()
 
     # オーバーラップ検出の重複除去（NMS）
@@ -1973,6 +2039,7 @@ def handle_rescore(job: dict):
             raise
 
     from app.services.scanning import scan_tiles
+    progress = _AsyncProgress(_rescore_progress)
     try:
         detections = scan_tiles(
             model_path=model_path,
@@ -1981,10 +2048,11 @@ def handle_rescore(job: dict):
             batch_size=128,
             num_workers=32,
             tile_set=tile_set,
-            progress_callback=_rescore_progress,
+            progress_callback=progress,
             cancel_event=_cancel_event,
         )
     finally:
+        progress.close()
         _unregister_cancel_event(_cancel_event)
 
     # 3. 既存アノテーションとIoUマッチング → スコア更新

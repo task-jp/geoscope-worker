@@ -21,6 +21,7 @@ tile_fetcher (リモート DEM 取得) の意味。進捗の保存はウィン�
 """
 from __future__ import annotations
 
+from collections import deque
 import functools
 import os
 import queue
@@ -35,7 +36,7 @@ import numpy as np
 import torch
 
 from app.core.dem import TILE_PX, dem_deps, pixel_to_latlon
-from app.core.gpu3ch import EXTENDED_PX, NAN_BGR, SLOT_BYTES, GraphGen, infer_yolo_direct, ksize_for
+from app.core.gpu3ch import EXTENDED_PX, NAN_BGR, SLOT_BYTES, GraphGen, infer_yolo_collect, infer_yolo_launch, ksize_for
 from app.core.visualization import cell_size_m
 from app.services.detections import resolve_detection
 
@@ -434,7 +435,10 @@ def scan_tiles_gpu(
         processed = 0
         workers_done = 0
         t0 = time.monotonic()
-        prof = {"wait": 0.0, "issue": 0.0, "gather": 0.0, "infer": 0.0, "n_gen": 0, "n_inf": 0}
+        prof = {"wait": 0.0, "issue": 0.0, "infer": 0.0, "collect": 0.0, "n_gen": 0, "n_inf": 0}
+        ring_free: list = [None, None]        # リングの各面を最後に読んだ推論の完了イベント
+        inflight_inf: deque = deque()         # 投入済みで結果を受け取っていない推論
+        MAX_INFLIGHT_INF = 2                  # これを超えたら古いものを待つ (リング 2 面なのでこれ以上は進めない)
         profiling = os.environ.get("GPU_3CH_PROFILE", "0") == "1"
         timeline = []            # (kind, start_event, end_event) 最初の数十件だけ
         t_ref = torch.cuda.Event(enable_timing=True); t_ref.record()
@@ -460,7 +464,7 @@ def scan_tiles_gpu(
                 flush_inf()
             dst = rings[ring_i][ring_pos:ring_pos + len(items)]
             ring_pos += len(items)
-            imgs, keep, ev, h2d = gen(items, dst=dst)
+            imgs, keep, ev, h2d = gen(items, dst=dst, dst_free=ring_free[ring_i])
             prof["issue"] += time.perf_counter() - tq; prof["n_gen"] += 1
             ready.append((imgs, keep, [(it[3], it[4]) for it in items], ev, gen.last_start_ev, time.perf_counter()))
             if profiling and len(timeline) < 60:
@@ -469,52 +473,62 @@ def scan_tiles_gpu(
             pending_release.append((h2d, [it[0] for it in items]))
 
         def flush_inf():
-            """いまの面にある生成済み画像を全部推論する (面は連続領域なので cat しない)。
+            """いまの面にある生成済み画像を全部推論に投入する (面は連続領域なので cat しない)。結果は待たない:
+            CPU への転送が終わったものから collect_done が受け取る。待っている間に次の生成を投入するため。
             生成対象外 (keep=False) も推論に含めて結果を捨てる。割合が小さく、詰め直すコピーより安い。"""
-            nonlocal n_ready, total_detections, ring_i, ring_pos
+            nonlocal n_ready, ring_i, ring_pos
             if not ready:
                 return
             tq = time.perf_counter()
             take = ready[:]
             ready.clear()
             n_ready = 0
-            cur = inf_stream
             for r in take:
-                cur.wait_event(r[3])
+                inf_stream.wait_event(r[3])
             if profiling:
-                torch.cuda.synchronize()
                 for r in take:
-                    prof["gen_gpu_ms"] = prof.get("gen_gpu_ms", 0.0) + r[3].elapsed_time(r[4]) if False else prof.get("gen_gpu_ms", 0.0) + r[4].elapsed_time(r[3])
                     prof["gen_age_ms"] = prof.get("gen_age_ms", 0.0) + (time.perf_counter() - r[5]) * 1000
             total_n = sum(len(r[2]) for r in take)
             imgs = rings[ring_i][:total_n]
-            with torch.cuda.stream(inf_stream):
-                kl = torch.cat([r[1] for r in take]).tolist()
             metas = [m for r in take for m in r[2]]
-            ring_i ^= 1
-            ring_pos = 0
-            prof["gather"] += time.perf_counter() - tq
-            if not any(kl):
-                return
-            tq = time.perf_counter()
             with torch.cuda.stream(inf_stream):
+                keep_h = torch.empty(total_n, dtype=torch.bool, pin_memory=True)
+                keep_h.copy_(torch.cat([r[1] for r in take]), non_blocking=True)
                 if profiling and len(timeline) < 60:
                     e0 = torch.cuda.Event(enable_timing=True); e0.record()
-                batch_dets = infer_yolo_direct(net, imgs, conf_threshold)   # 中の .cpu() が inf_stream の同期点
+                pend = infer_yolo_launch(net, imgs, conf_threshold)
                 if profiling and len(timeline) < 60:
                     e1 = torch.cuda.Event(enable_timing=True); e1.record(); timeline.append(("inf", e0, e1))
+                free_ev = torch.cuda.Event()
+                free_ev.record()
+            ring_free[ring_i] = free_ev   # この面への次の書き込みは推論の後
+            inflight_inf.append((pend, keep_h, metas, [(r[4], r[3]) for r in take] if profiling else None))
+            ring_i ^= 1
+            ring_pos = 0
             prof["infer"] += time.perf_counter() - tq; prof["n_inf"] += 1
-            batch_dets = [d for d, kp in zip(batch_dets, kl) if kp]
-            metas = [m for m, kp in zip(metas, kl) if kp]
-            for dets, (tx, ty) in zip(batch_dets, metas):
-                for d in dets:
-                    rec = resolve_detection(d, tx, ty, z)
-                    if rec is not None:
-                        all_detections.append(rec)
+
+        def collect_done(block: bool = False):
+            """転送が終わった推論結果を検出にする。block=True なら全部待つ。"""
+            nonlocal total_detections
+            tq = time.perf_counter()
+            while inflight_inf and (block or len(inflight_inf) > MAX_INFLIGHT_INF or inflight_inf[0][0][0].query()):
+                pend, keep_h, metas, gen_evs = inflight_inf.popleft()
+                batch_dets = infer_yolo_collect(pend)   # keep_h の転送は推論より前に投入済み
+                for dets, (tx, ty), kp in zip(batch_dets, metas, keep_h.tolist()):
+                    if not kp:
+                        continue
+                    for d in dets:
+                        rec = resolve_detection(d, tx, ty, z)
+                        if rec is not None:
+                            all_detections.append(rec)
+                if gen_evs:
+                    for st, en in gen_evs:
+                        prof["gen_gpu_ms"] = prof.get("gen_gpu_ms", 0.0) + st.elapsed_time(en)
             if detection_callback and all_detections:
                 detection_callback(all_detections[:])
                 total_detections += len(all_detections)
                 all_detections.clear()
+            prof["collect"] += time.perf_counter() - tq
 
         def account(widx, tid):
             """タスク完了で投入枠を返し、ウィンドウ完了の前進に合わせて進捗を保存する (レジュームの正しさはここで決まる)。"""
@@ -542,6 +556,7 @@ def scan_tiles_gpu(
             except queue.Empty:
                 prof["wait"] += time.perf_counter() - tq
                 release_slots()
+                collect_done()
                 continue
             prof["wait"] += time.perf_counter() - tq
             if r[0] == "done":
@@ -558,6 +573,7 @@ def scan_tiles_gpu(
             if n_ready + GEN_BATCH > batch_size:
                 flush_inf()
             release_slots()
+            collect_done()
             # 完了の計上: 生成に回したタイルは推論後ではなく受領時点で数える (旧実装と同じ粒度)
             if r[0] is not None:
                 account(widx, tid)
@@ -573,6 +589,7 @@ def scan_tiles_gpu(
                 flush_bucket(k)
             while ready:
                 flush_inf()
+            collect_done(block=True)
             torch.cuda.synchronize()
             if progress_save_callback:
                 progress_save_callback(resume_from + processed)
@@ -583,8 +600,8 @@ def scan_tiles_gpu(
                     lines.append(f"{kind} {t_ref.elapsed_time(a):8.1f}→{t_ref.elapsed_time(b):8.1f} ({b.elapsed_time(a)*-1:5.1f}ms)" if False else
                                  f"{kind} {t_ref.elapsed_time(a):8.1f}→{t_ref.elapsed_time(b):8.1f} ({a.elapsed_time(b):5.1f}ms)")
                 per = 1000 / processed
-                msg = "profile ms/tile: wait-for-decoders %.2f | gen-issue %.2f | gather %.2f | infer %.2f | wall %.2f (gen calls %d, infer calls %d; per gen batch: GPU %.1f ms, issue→gather %.1f ms)" % (
-                    prof["wait"] * per, prof["issue"] * per, prof["gather"] * per, prof["infer"] * per,
+                msg = "profile ms/tile: wait-for-decoders %.2f | gen-issue %.2f | infer-issue %.2f | collect %.2f | wall %.2f (gen calls %d, infer calls %d; per gen batch: GPU %.1f ms, issue→infer-issue %.1f ms)" % (
+                    prof["wait"] * per, prof["issue"] * per, prof["infer"] * per, prof["collect"] * per,
                     (time.monotonic() - t0) * per, prof["n_gen"], prof["n_inf"],
                     prof.get("gen_gpu_ms", 0.0) / max(1, prof["n_gen"]), prof.get("gen_age_ms", 0.0) / max(1, prof["n_gen"]))
                 print("[scanning_gpu] " + msg, flush=True)        # ワーカーのログにも残す (進捗メッセージは上書きされる)

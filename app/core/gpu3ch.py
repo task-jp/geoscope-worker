@@ -314,11 +314,12 @@ class GraphGen:
                 self._build(k)
 
     @torch.no_grad()
-    def __call__(self, items: list[tuple], dst: torch.Tensor | None = None):
+    def __call__(self, items: list[tuple], dst: torch.Tensor | None = None, dst_free: torch.cuda.Event | None = None):
         """items: 同じ ksize の (slot, cs, ksize, ...) (len ≤ B)。
         戻り値 (out, keep (n,) bool cuda, ready_event, h2d_event)。out は output="uint8" なら (n,H,W,3) uint8 の
         clone、output="infer" なら dst (推論入力 (n,3,H,W) fp16 を書き込んだテンソル)。
-        h2d_event の後は共有メモリのスロットを再利用してよい。"""
+        h2d_event の後は共有メモリのスロットを再利用してよい。
+        dst_free: dst を前に読んでいた処理 (推論) の完了イベント。dst への書き込みはその後に行う。"""
         k = items[0][2]
         if k not in self.graphs:
             self._build(k)
@@ -343,6 +344,8 @@ class GraphGen:
             h2d_ev.record(self.stream)
             g.replay()
             if dst is not None:
+                if dst_free is not None:
+                    self.stream.wait_event(dst_free)   # リングの同じ面をまだ推論が読んでいるかもしれない
                 dst.copy_(o_img[:n], non_blocking=True)
                 imgs = dst
             else:
@@ -375,6 +378,16 @@ def infer_yolo_direct(net, imgs_u8: torch.Tensor, conf: float, max_det: int = 30
     scale_boxes = clip だけ。ここではそれをバッチで行い、CPU への転送を 1 回にする。
     辞書化は scanning._infer_yolo と同じ float32 演算。実測で predict と 442/442 件ビット一致。
     """
+    return infer_yolo_collect(infer_yolo_launch(net, imgs_u8, conf, max_det))
+
+
+@torch.no_grad()
+def infer_yolo_launch(net, imgs_u8: torch.Tensor, conf: float, max_det: int = 300):
+    """infer_yolo_direct の前半。forward と後処理を現在のストリームに投入し、結果の CPU への転送も
+    非同期に始めてすぐ戻る。戻り値を infer_yolo_collect に渡すと検出の辞書が得られる。
+
+    スキャンでは、結果を待つ間に主スレッドが次の生成を GPU に投入できるよう、この 2 つを分けて呼ぶ。
+    同期 (.cpu()) で待つと、その間 GPU の生成ストリームが空になり、GPU の使用率が半分に落ちた (実測)。"""
     half = _is_half(net)
     if imgs_u8.dtype == torch.uint8:
         batch = imgs_u8.permute(0, 3, 1, 2)[:, [2, 1, 0]]
@@ -388,11 +401,27 @@ def infer_yolo_direct(net, imgs_u8: torch.Tensor, conf: float, max_det: int = 30
         raise ValueError(f"end2end (NMS-free) の出力を想定: {tuple(preds.shape)}")
     preds = preds.float()[:, :max_det]
     mask = preds[..., 4] > conf
-    p = preds.clone()
+    p = preds.clone()   # TensorRT の出力は使い回しのバッファなので、次の推論に上書きされる前に複製する
     w = h = float(imgs_u8.shape[2])
     p[..., 0].clamp_(0, w); p[..., 1].clamp_(0, h); p[..., 2].clamp_(0, w); p[..., 3].clamp_(0, h)
-    mask_c = mask.cpu().numpy()
-    p_c = p.cpu().numpy()
+    if not p.is_cuda:
+        return None, mask, p
+    mask_h = torch.empty(mask.shape, dtype=mask.dtype, pin_memory=True)
+    p_h = torch.empty(p.shape, dtype=p.dtype, pin_memory=True)
+    mask_h.copy_(mask, non_blocking=True)
+    p_h.copy_(p, non_blocking=True)
+    ev = torch.cuda.Event()
+    ev.record()
+    return ev, mask_h, p_h
+
+
+def infer_yolo_collect(pending) -> list[list[dict]]:
+    """infer_yolo_launch の結果を待って (転送完了まで) 検出の辞書にする。"""
+    ev, mask_h, p_h = pending
+    if ev is not None:
+        ev.synchronize()
+    mask_c = mask_h.numpy()
+    p_c = p_h.numpy()
     out = []
     for b in range(p_c.shape[0]):
         dets = []
