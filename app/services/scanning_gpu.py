@@ -62,9 +62,10 @@ def prepare_direct_model(model, conf_threshold: float, device):
         preds = preds[0]
     if preds.ndim != 3 or preds.shape[-1] != 6:
         return None
-    if os.environ.get("GPU_INFER_HALF", "0") == "1":
-        # fp16 推論。前方後円墳モデルでの評価 (2026-10-12): val mAP50 0.8231→0.8230、⭕ 再現 527/632 で同数、
-        # スキャン相当の検出 778 件中 777 件一致 (conf 差 最大 0.0065)。既定は fp32 (本番と同じ数値)。
+    if os.environ.get("GPU_INFER_HALF", "1") != "0":
+        # fp16 推論 (既定)。前方後円墳モデルでの評価 (2026-10-12): val mAP50 0.8231→0.8230、⭕ 再現 527/632 で同数、
+        # スキャン相当の検出 778 件中 777 件一致 (conf 差 最大 0.0065)、速度 432→563 tile/s。
+        # 採用基準「YOLO のスキャンに影響のない範囲の誤差は許容」に収まるとして既定化 (ユーザー決定)。GPU_INFER_HALF=0 で fp32。
         getattr(net, "model", net).half()   # AutoBackend は内部モデルを子モジュールにしないので直接変換する
         net.fp16 = True
     return net
