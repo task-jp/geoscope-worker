@@ -1,0 +1,313 @@
+"""3ch 生成 (dem_to_3ch) の GPU 版。CPU 版 (visualization.dem_to_3ch) と同じ画素を出す。
+
+なぜ GPU か:
+  CPU 版は 1 枚 308ms かかり、GPU の推論 (2.7ms) に追いつかないので 3ch キャッシュ (768px、
+  全国で 782GB) が必要だった。GPU で生成すれば 1 枚 0.9ms (融合時) で、キャッシュ自体が要らなくなる。
+  ワーカーはどの構成でも GPU を持つ (YOLO を動かすため) ので、CPU 数に依存しない。
+
+同一性の担保:
+  - 倍精度 (float64) で、CPU 版と同じ演算を同じ順序で行う。勾配は np.gradient と同じ差分、
+    ガウス核とラプラシアン核は cv2.getGaussianKernel / cv2.getDerivKernels から取り、境界は
+    reflect-101 (OpenCV の既定) = torch の 'reflect'。
+  - 曲率は「ガウス平滑化 → ラプラシアン」を 1 つの合成核にまとめて FFT で畳み込む。両方の核が
+    対称で境界が reflect-101 なので、reflect(17px) → 合成核 1 回と同値。
+  - 陰影の三角関数は代数に置換 (cos(aspect)=dx/r 等)。数学的に同値で、丸めが変わるだけ。
+  - 実測: 既存キャッシュ 2,911 枚 (51 億値) と比べて 1 値だけ 1 階調差。採用基準は
+    「YOLO のスキャンに影響のない範囲の誤差は許容」(2026-10-12 決定)。
+
+速度:
+  要素演算は torch.compile (inductor → Triton) で融合する。コンパイラが無い環境では eager に落ちる
+  (1.6ms/枚、画素は同じ)。生成全体を ksize ごとに CUDA Graph に捕捉し、専用ストリームで再生する。
+  復号プロセスが CPU を使っていても、Graph の再生時間は変わらない (launch が 1 回だから)。
+
+入力の約束:
+  復号側は DEM WebP の生バイト (768x768x3 uint8、cv2 の BGR 順) と、現行コードと同じ np.nanmean で
+  求めた NaN 埋め値を渡す。標高への復号 (x*0.01 など) はここで倍精度で行う。IEEE の乗算なので
+  CPU と同じ値になる。隣接タイルが無い領域は (B,G,R)=(128,0,0)... ではなく R=128,G=0,B=0
+  (x = 2^23 = 無効) で埋める (NAN_BGR)。
+"""
+from __future__ import annotations
+
+import math
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from app.core.dem import TILE_PX
+from app.core.visualization import CURVATURE_SMOOTH_M
+
+EXTENDED_PX = TILE_PX + TILE_PX // 2   # 768 (detections.py と同じ定義)
+DT = torch.float64
+NAN_BGR = np.array([0, 0, 128], np.uint8)   # cv2 BGR 順。R=128,G=0,B=0 → x = 2^23 → NaN
+SLOT_BYTES = EXTENDED_PX * EXTENDED_PX * 3
+
+
+def ksize_for(cell_size: float) -> int:
+    """visualization.dem_to_3ch と同じ ksize (曲率の平滑化幅、奇数)。"""
+    return max(3, int(round(CURVATURE_SMOOTH_M / cell_size)) | 1)
+
+
+# ---------------------------------------------------------------- 復号
+def gpu_decode_fill(bgr_u8: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+    """(B,H,W,3) uint8 BGR → (B,H,W) float64 標高。dem.load_dem_raw と同じ式。NaN は mean で埋める。"""
+    c = bgr_u8.to(DT)
+    x = c[..., 2] * 65536 + c[..., 1] * 256 + c[..., 0]
+    elev = torch.where(x > 2**23, (x - 2**24) * 0.01, x * 0.01)
+    return torch.where(x == 2**23, mean.view(-1, 1, 1).to(DT), elev)
+
+
+# ---------------------------------------------------------------- 勾配・陰影・傾斜
+def _gradient(f: torch.Tensor, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """np.gradient(f, h) と同じ: 内側は中心差分、端は片側差分。f: (B,1,H,W)、h: (B,1,1,1)。戻り値 (dy, dx)。"""
+    dy = torch.empty_like(f)
+    dy[:, :, 1:-1] = (f[:, :, 2:] - f[:, :, :-2]) / (2 * h)
+    dy[:, :, :1] = (f[:, :, 1:2] - f[:, :, :1]) / h
+    dy[:, :, -1:] = (f[:, :, -1:] - f[:, :, -2:-1]) / h
+    dx = torch.empty_like(f)
+    dx[..., 1:-1] = (f[..., 2:] - f[..., :-2]) / (2 * h)
+    dx[..., :1] = (f[..., 1:2] - f[..., :1]) / h
+    dx[..., -1:] = (f[..., -1:] - f[..., -2:-1]) / h
+    return dy, dx
+
+
+def _shade_slope(dy: torch.Tensor, dx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """multi_hillshade (4 方位の平均) と compute_slope を、三角関数を代数に置き換えて計算する。
+    cos(az-aspect) を az∈{0,90,180,270} で展開すると cos a, sin a, -cos a, -sin a。
+    cos(aspect)=dx/r, sin(aspect)=-dy/r, cos(slope)=1/sqrt(1+r²), sin(slope)=r/sqrt(1+r²)。"""
+    alt = math.radians(45)
+    r2 = dx * dx + dy * dy
+    r = torch.sqrt(r2)
+    slope = torch.atan(r)
+    inv = torch.rsqrt(1 + r2)
+    cos_s, sin_s = inv, r * inv
+    safe = torch.where(r > 0, r, torch.ones_like(r))
+    cos_a = torch.where(r > 0, dx / safe, torch.ones_like(r))   # atan2(0,0)=0 → cos=1, sin=0
+    sin_a = torch.where(r > 0, -dy / safe, torch.zeros_like(r))
+    base = math.sin(alt) * cos_s
+    k = math.cos(alt) * sin_s
+    shade = (torch.clamp(base + k * cos_a, 0, 1) + torch.clamp(base + k * sin_a, 0, 1)
+             + torch.clamp(base - k * cos_a, 0, 1) + torch.clamp(base - k * sin_a, 0, 1))
+    return shade / 4, torch.clamp(slope / (math.pi / 4), 0, 1)
+
+
+# ---------------------------------------------------------------- 曲率 (FFT 合成核)
+def _fft_size(n: int) -> int:
+    """n 以上で 2,3,5 だけを素因数に持つ長さ。実測では 900 (768+34 に対して) が最速だった。"""
+    m = max(n, 900)
+    while True:
+        x = m
+        for p in (2, 3, 5):
+            while x % p == 0:
+                x //= p
+        if x == 1:
+            return m
+        m += 1
+
+
+class CurvFFT:
+    """compute_curvature の「GaussianBlur(k) → Laplacian(5)」を合成核 1 回の FFT 畳み込みで行う。
+    出力は -lap (neg_lap) 相当。正規化 (mean/std) は呼び出し側。"""
+
+    def __init__(self, k: int, H: int, W: int, device: torch.device):
+        g = cv2.getGaussianKernel(k, 0)                                   # (k,1) float64
+        kd, ks = cv2.getDerivKernels(2, 0, 5, normalize=False, ktype=cv2.CV_64F)
+        G2 = g @ g.T
+        lap = ks @ kd.T + kd @ ks.T                                       # d2x + d2y
+        K = -cv2.filter2D(np.pad(G2, 2), -1, lap, borderType=cv2.BORDER_CONSTANT)
+        self.pad = K.shape[0] // 2
+        self.H, self.W = H, W
+        self.N1, self.N2 = _fft_size(H + 2 * self.pad), _fft_size(W + 2 * self.pad)
+        kern = np.zeros((self.N1, self.N2))
+        p = self.pad
+        for i in range(-p, p + 1):
+            for j in range(-p, p + 1):
+                kern[i % self.N1, j % self.N2] = K[i + p, j + p]
+        self.Kf = torch.fft.rfft2(torch.from_numpy(kern).to(device, DT))
+
+    def __call__(self, f: torch.Tensor) -> torch.Tensor:
+        p = self.pad
+        mu = f.mean(dim=(2, 3), keepdim=True)                              # 平均を引いて丸め誤差を抑える
+        fp = F.pad(f - mu, (p, p, p, p), mode="reflect")
+        fp = F.pad(fp, (0, self.N2 - fp.shape[-1], 0, self.N1 - fp.shape[-2]))
+        out = torch.fft.irfft2(torch.fft.rfft2(fp) * self.Kf, s=(self.N1, self.N2))
+        return out[..., p:p + self.H, p:p + self.W]
+
+
+def _curvature(curv: CurvFFT, f: torch.Tensor) -> torch.Tensor:
+    neg = curv(f)
+    mean = neg.mean(dim=(1, 2, 3), keepdim=True)
+    std = neg.std(dim=(1, 2, 3), keepdim=True, unbiased=False).clamp_min(0.01)
+    return torch.clamp((neg - mean) / (3 * std) * 0.5 + 0.5, 0, 1)
+
+
+# ---------------------------------------------------------------- 前段 / 後段 (compile の単位)
+def front(bgr_u8: torch.Tensor, mean: torch.Tensor, cs: torch.Tensor):
+    """復号 + 勾配 + 陰影/傾斜。戻り値 (f (B,1,H,W), ch0, ch1)。"""
+    f = gpu_decode_fill(bgr_u8, mean).unsqueeze(1)
+    dy, dx = _gradient(f, cs.view(-1, 1, 1, 1))
+    ch0, ch1 = _shade_slope(dy, dx)
+    return f, ch0, ch1
+
+
+def back(ch0: torch.Tensor, ch1: torch.Tensor, ch2: torch.Tensor):
+    """uint8 画像と、_gen_3ch_uncached の「min(img[:,:,c].std()) < 3 → None」判定。
+    uint8 なので和・二乗和は int64 で厳密に取れる。戻り値 (img (B,H,W,3) uint8, keep (B,) bool)。"""
+    img = torch.cat([ch0, ch1, ch2], dim=1).permute(0, 2, 3, 1)
+    img = (img * 255).to(torch.uint8)
+    x = img.to(torch.int64)
+    n = img.shape[1] * img.shape[2]
+    s1 = x.sum(dim=(1, 2)).to(DT)
+    s2 = (x * x).sum(dim=(1, 2)).to(DT)
+    std = torch.sqrt(torch.clamp(s2 / n - (s1 / n) ** 2, min=0))
+    return img, std.min(dim=1).values >= 3
+
+
+def dem_to_3ch_gpu(bgr_u8: torch.Tensor, mean: torch.Tensor, cs: torch.Tensor, curv: CurvFFT):
+    """eager 版 (テストと compile 不可環境用)。"""
+    f, ch0, ch1 = front(bgr_u8, mean, cs)
+    return back(ch0, ch1, _curvature(curv, f))
+
+
+def try_compile(fn):
+    """torch.compile を試し、コンパイラ (gcc/Triton) が無ければ None。"""
+    try:
+        return torch.compile(fn, dynamic=False)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- CUDA Graph 生成器
+class GraphGen:
+    """ksize ごとに CUDA Graph を持ち、専用ストリームで非同期に再生する。
+
+    入力は共有メモリ上の (slots, H, W, 3) uint8 テンソル (cudaHostRegister 済み) のスロット番号。
+    __call__ は GPU に仕事を投入してすぐ戻る。戻り値の画像は ready_event の後に完成している。
+    捕捉は常に 1 本の cap_stream で行う (別ストリームだと共有プールのブロックが再利用されず
+    5 本で 10GB に膨らんで OOM になった)。
+    """
+
+    def __init__(self, device: torch.device, B: int, shm_tensor: torch.Tensor, compiled: bool = True):
+        self.device, self.B, self.shm = device, B, shm_tensor
+        self.stream = torch.cuda.Stream()
+        self.cap_stream = torch.cuda.Stream()
+        self.pool = torch.cuda.graph_pool_handle()
+        self.graphs: dict[int, tuple] = {}
+        self.c_front = try_compile(front) if compiled else None
+        self.c_back = try_compile(back) if compiled else None
+        self.compiled = self.c_front is not None and self.c_back is not None
+        self.host_mean = [torch.empty(B, dtype=DT).pin_memory() for _ in range(2)]
+        self.host_cs = [torch.empty(B, dtype=DT).pin_memory() for _ in range(2)]
+        self.host_ev = [torch.cuda.Event(), torch.cuda.Event()]
+        self.hi = 0
+
+    def _build(self, k: int) -> None:
+        curv = CurvFFT(k, EXTENDED_PX, EXTENDED_PX, self.device)
+        if self.compiled:
+            c_curv = try_compile(lambda f: _curvature(curv, f))
+            if c_curv is None:
+                self.compiled = False
+        if self.compiled:
+            def gen_fn(b, m, c):
+                f, ch0, ch1 = self.c_front(b, m, c)
+                return self.c_back(ch0, ch1, c_curv(f))
+        else:
+            def gen_fn(b, m, c):
+                return dem_to_3ch_gpu(b, m, c, curv)
+        s_bgr = torch.zeros((self.B, EXTENDED_PX, EXTENDED_PX, 3), dtype=torch.uint8, device=self.device)
+        s_bgr[..., 2] = 1   # 有効な適当値 (x = 65536) でウォームアップ
+        s_mean = torch.zeros(self.B, dtype=DT, device=self.device)
+        s_cs = torch.full((self.B,), 1.0, dtype=DT, device=self.device)
+        torch.cuda.synchronize()
+        try:
+            with torch.cuda.stream(self.cap_stream):
+                for _ in range(2):
+                    gen_fn(s_bgr, s_mean, s_cs)
+            torch.cuda.synchronize()
+        except Exception:
+            if not self.compiled:
+                raise
+            # コンパイル済み関数の実行に失敗 (Triton のビルド失敗など) → eager で作り直す
+            self.compiled = False
+            self._build(k)
+            return
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=self.pool, stream=self.cap_stream):
+            o_img, o_keep = gen_fn(s_bgr, s_mean, s_cs)
+        torch.cuda.synchronize()
+        # curv (FFT 核) と gen_fn を必ず保持する。解放されると Graph が再利用済みメモリを読み、曲率が壊れる。
+        self.graphs[k] = (g, s_bgr, s_mean, s_cs, o_img, o_keep, torch.cuda.Event(), (curv, gen_fn))
+
+    def prebuild(self, ksizes) -> None:
+        for k in sorted(set(ksizes)):
+            if k not in self.graphs:
+                self._build(k)
+
+    @torch.no_grad()
+    def __call__(self, items: list[tuple]):
+        """items: 同じ ksize の (slot, mean, cs, ksize, ...) (len ≤ B)。
+        戻り値 (imgs (n,H,W,3) uint8 cuda, keep (n,) bool cuda, ready_event, h2d_event)。
+        h2d_event の後は共有メモリのスロットを再利用してよい。"""
+        k = items[0][3]
+        if k not in self.graphs:
+            self._build(k)
+        g, s_bgr, s_mean, s_cs, o_img, o_keep, done_ev, _ = self.graphs[k]
+        n = len(items)
+        hi = self.hi
+        self.hi ^= 1
+        self.host_ev[hi].synchronize()
+        mean, cs = self.host_mean[hi], self.host_cs[hi]
+        mean.copy_(torch.tensor([it[1] for it in items] + [items[0][1]] * (self.B - n), dtype=DT))
+        cs.copy_(torch.tensor([it[2] for it in items] + [items[0][2]] * (self.B - n), dtype=DT))
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_event(done_ev)            # 同じ Graph の前回再生 (静的バッファ使用中) を待つ
+            for i, it in enumerate(items):
+                s_bgr[i].copy_(self.shm[it[0]], non_blocking=True)
+            if n < self.B:
+                s_bgr[n:].copy_(s_bgr[0].expand(self.B - n, -1, -1, -1))
+            s_mean.copy_(mean, non_blocking=True)
+            s_cs.copy_(cs, non_blocking=True)
+            self.host_ev[hi].record(self.stream)
+            h2d_ev = torch.cuda.Event()
+            h2d_ev.record(self.stream)
+            g.replay()
+            imgs, keep = o_img[:n].clone(), o_keep[:n].clone()
+            done_ev.record(self.stream)
+            ready_ev = torch.cuda.Event()
+            ready_ev.record(self.stream)
+        return imgs, keep, ready_ev, h2d_ev
+
+
+# ---------------------------------------------------------------- 直接推論
+@torch.no_grad()
+def infer_yolo_direct(net, imgs_u8: torch.Tensor, conf: float, max_det: int = 300) -> list[list[dict]]:
+    """ultralytics の model.predict と同じ結果を、ラッパーを通さずに得る。
+
+    predict は入力バッチ全体を CPU に戻して numpy 化し (convert_torch2numpy_batch)、画像ごとに Results を
+    作る。実測で 1 枚 0.9ms (CPU が混むと 3ms) かかり、forward (1.0ms) と同じかそれ以上だった。
+    end2end モデルの後処理は `pred[pred[:,4] > conf][:max_det]` と、同サイズなので gain=1/pad=0 の
+    scale_boxes = clip だけ。ここではそれをバッチで行い、CPU への転送を 1 回にする。
+    辞書化は scanning._infer_yolo と同じ float32 演算。実測で predict と 442/442 件ビット一致。
+    """
+    batch = imgs_u8.permute(0, 3, 1, 2)[:, [2, 1, 0]].float() / 255
+    preds = net(batch)
+    if isinstance(preds, (list, tuple)):
+        preds = preds[0]
+    if preds.ndim != 3 or preds.shape[-1] != 6:
+        raise ValueError(f"end2end (NMS-free) の出力を想定: {tuple(preds.shape)}")
+    preds = preds[:, :max_det]
+    mask = preds[..., 4] > conf
+    p = preds.clone()
+    w = h = float(imgs_u8.shape[2])
+    p[..., 0].clamp_(0, w); p[..., 1].clamp_(0, h); p[..., 2].clamp_(0, w); p[..., 3].clamp_(0, h)
+    mask_c = mask.cpu().numpy()
+    p_c = p.cpu().numpy()
+    out = []
+    for b in range(p_c.shape[0]):
+        dets = []
+        for x1, y1, x2, y2, cf, cl in p_c[b][mask_c[b]]:
+            dets.append({"cx": float((x1 + x2) / 2), "cy": float((y1 + y2) / 2), "w": float(x2 - x1),
+                         "h": float(y2 - y1), "conf": float(cf), "cls": int(cl)})
+        out.append(dets)
+    return out

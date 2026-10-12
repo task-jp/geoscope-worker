@@ -309,46 +309,6 @@ def _nms_detections(detections: list[dict], iou_threshold: float = 0.5) -> list[
     return keep
 
 
-def _batch_dem_to_3ch_gpu(elevs: np.ndarray) -> np.ndarray:
-    """GPU batch 3ch generation using CuPy. Input: (N, 512, 512) float64. Output: (N, 512, 512, 3) uint8."""
-    import cupy as cp
-    from cupyx.scipy.ndimage import uniform_filter, laplace
-    import math
-
-    batch = cp.asarray(elevs)
-    dy = cp.diff(batch, axis=1, prepend=batch[:, :1, :])
-    dx = cp.diff(batch, axis=2, prepend=batch[:, :, :1])
-    slope_angle = cp.arctan(cp.sqrt(dx**2 + dy**2))
-    aspect = cp.arctan2(-dy, dx)
-
-    # Multi-direction hillshade
-    alt = math.radians(45)
-    shades = []
-    for az_deg in [0, 90, 180, 270]:
-        az = math.radians(az_deg)
-        shade = cp.clip(
-            math.sin(alt) * cp.cos(slope_angle) + math.cos(alt) * cp.sin(slope_angle) * cp.cos(az - aspect),
-            0, 1)
-        shades.append(shade)
-    hillshade = cp.mean(cp.stack(shades), axis=0)
-
-    # Slope
-    slope_norm = cp.clip(slope_angle / (cp.pi / 4), 0, 1)
-
-    # Curvature
-    smoothed = uniform_filter(batch, size=(1, 31, 31))
-    lap = laplace(smoothed)
-    neg_lap = -lap
-    std = cp.maximum(cp.std(neg_lap, axis=(1, 2), keepdims=True), 0.01)
-    mean = cp.mean(neg_lap, axis=(1, 2), keepdims=True)
-    curvature = cp.clip((neg_lap - mean) / (3 * std) * 0.5 + 0.5, 0, 1)
-
-    result = cp.stack([
-        (hillshade * 255).astype(cp.uint8),
-        (slope_norm * 255).astype(cp.uint8),
-        (curvature * 255).astype(cp.uint8),
-    ], axis=3)
-    return result.get()
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +398,7 @@ def _infer_yolo(
 
     注意: tensor を渡すと ultralytics は /255 の正規化を行わない (呼び出し側の責任)。
     """
-    if images and isinstance(images[0], np.ndarray):
+    if isinstance(images, list) and images and isinstance(images[0], np.ndarray):
         gpu = [torch.from_numpy(im).to(device, non_blocking=True) for im in images]
         batch = torch.stack(gpu).permute(0, 3, 1, 2)[:, [2, 1, 0]].float() / 255
     else:
@@ -592,6 +552,20 @@ def scan_tiles(
         if progress_callback:
             progress_callback(1.0, "No tiles found")
         return []
+
+    # z=16 / CUDA / YOLO end2end なら 3ch を GPU で生成する実装へ (3ch キャッシュ不要、実測 111 → 413 tile/s)。
+    # z=15、RT-DETR、CUDA 無し (Mac の MPS は倍精度非対応) は従来の CPU 生成経路のまま。
+    from app.services.scanning_gpu import gpu_scan_available, scan_tiles_gpu
+    if gpu_scan_available(model_type, z):
+        try:
+            return scan_tiles_gpu(
+                model, tiles_dir, tiles, conf_threshold, batch_size, num_workers,
+                progress_callback, detection_callback, tile_fetcher, resume_from,
+                progress_save_callback, cancel_event, z=z,
+            )
+        except ValueError as e:   # end2end でないモデル (yolo11 など) → 従来経路
+            if progress_callback:
+                progress_callback(resume_from / max(1, len(tiles)), f"GPU 3ch unavailable ({e}); CPU path")
 
     # 150%拡張タイル: 各タイルを768×768に拡張（右+256, 下+256, 右下+256×256）
     # 隣接タイルはスキャン対象集合に入っているかで絞らない。絞ると都道府県

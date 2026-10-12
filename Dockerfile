@@ -7,8 +7,9 @@
 FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
+# gcc は torch.compile (Triton) の補助モジュールのビルドに必要。無いと 3ch 生成が eager に落ちる (1.6ms/枚、画素は同じ)。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 ca-certificates curl tar \
+    libgl1 libglib2.0-0 ca-certificates curl tar gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
