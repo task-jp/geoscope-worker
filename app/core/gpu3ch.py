@@ -45,6 +45,16 @@ NAN_BGR = np.array([0, 0, 128], np.uint8)   # cv2 BGR 順。R=128,G=0,B=0 → x 
 SLOT_BYTES = EXTENDED_PX * EXTENDED_PX * 3
 
 
+def slot_px(z: int) -> int:
+    """復号プロセスが共有メモリに置く生バイト canvas の一辺。z16 は DEM 4 枚から 768。
+    z15 は z16 の 3×3 枚 (1536) をそのまま置き、GPU で 2×2 平均して 768 にする (dem.load_dem_z と同じ縮約)。"""
+    if z == 16:
+        return EXTENDED_PX
+    if z == 15:
+        return 2 * EXTENDED_PX
+    raise ValueError(f"unsupported zoom: {z}")
+
+
 def ksize_for(cell_size: float) -> int:
     """visualization.dem_to_3ch と同じ ksize (曲率の平滑化幅、奇数)。"""
     return max(3, int(round(CURVATURE_SMOOTH_M / cell_size)) | 1)
@@ -54,15 +64,34 @@ def ksize_for(cell_size: float) -> int:
 MIN_VALID = TILE_PX * TILE_PX * 0.3   # _gen_3ch_uncached と同じ「有効画素 30% 未満は生成しない」(768 canvas に対しても 512² 基準)
 
 
+def _pool2_nanmean(elev: torch.Tensor, invalid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """z16 の標高 (B,2H,2W) を 2×2 ブロックの nanmean で (B,H,W) にする。dem.load_dem_z と同じ縮約:
+    np.nanmean(blocks, axis=2) は NaN を 0 にした和 ((a00+a01)+a10)+a11 を有効数で割る。同じ順で足す。
+    戻り値 (標高, 無効マスク)。4 画素とも無効なら無効。"""
+    B, H2, W2 = elev.shape
+    z = torch.where(invalid, torch.zeros((), dtype=elev.dtype, device=elev.device), elev)
+    z = z.view(B, H2 // 2, 2, W2 // 2, 2)
+    v = (~invalid).view(B, H2 // 2, 2, W2 // 2, 2)
+    s = ((z[:, :, 0, :, 0] + z[:, :, 0, :, 1]) + z[:, :, 1, :, 0]) + z[:, :, 1, :, 1]
+    n = ((v[:, :, 0, :, 0].to(torch.int32) + v[:, :, 0, :, 1]) + v[:, :, 1, :, 0]) + v[:, :, 1, :, 1]
+    inv = n == 0
+    return s / n.clamp_min(1).to(elev.dtype), inv
+
+
 def gpu_decode_fill(bgr_u8: torch.Tensor, dtype=DT) -> tuple[torch.Tensor, torch.Tensor]:
     """(B,H,W,3) uint8 BGR → (B,H,W) 標高 (dtype) と有効画素数 (B,)。dem.load_dem_raw と同じ式。
     無効画素 (x = 2^23) は有効画素の平均で埋める (_gen_3ch_uncached の canvas[np.isnan] = np.nanmean と同じ)。
     平均は倍精度で合計して求める。以前は復号プロセスが倍精度の標高配列を作って np.nanmean していたが、
-    その変換 (タイル 1 枚あたり数十 MB のメモリ往復) が 32 プロセスでメモリ帯域を食い潰し復号が律速になった。"""
-    c = bgr_u8.to(dtype)
+    その変換 (タイル 1 枚あたり数十 MB のメモリ往復) が 32 プロセスでメモリ帯域を食い潰し復号が律速になった。
+    入力が 1536 角 (z15) なら、復号した z16 の標高を倍精度で 2×2 平均してから同じ処理をする。"""
+    pooled = bgr_u8.shape[1] == 2 * EXTENDED_PX
+    c = bgr_u8.to(DT if pooled else dtype)
     x = c[..., 2] * 65536 + c[..., 1] * 256 + c[..., 0]      # < 2^24 なので float32 でも厳密
     invalid = x == 2**23
     elev = torch.where(x > 2**23, (x - 2**24) * 0.01, x * 0.01)
+    if pooled:   # CPU 版は倍精度で nanmean するので、平均までは倍精度で行う
+        elev, invalid = _pool2_nanmean(elev, invalid)
+        elev = elev.to(dtype)
     cnt = (~invalid).sum(dim=(1, 2))
     mean = torch.where(invalid, torch.zeros((), dtype=DT, device=elev.device), elev.to(DT)).sum(dim=(1, 2)) / cnt.clamp_min(1).to(DT)
     elev = torch.where(invalid, mean.to(dtype).view(-1, 1, 1), elev)
@@ -252,8 +281,10 @@ class GraphGen:
     def __init__(self, device: torch.device, B: int, shm_tensor: torch.Tensor, compiled: bool = True,
                  output: str = "uint8"):
         """output="uint8": (n,H,W,3) uint8 画像を返す (検証・テスト用)。
-        output="infer": 推論入力 (n,3,H,W) fp16 を __call__ の dst に直接書く (本番)。"""
+        output="infer": 推論入力 (n,3,H,W) fp16 を __call__ の dst に直接書く (本番)。
+        shm_tensor の一辺が 1536 なら z15 (z16 の 3×3 枚を GPU で 2×2 平均する)。出力は常に 768 角。"""
         self.device, self.B, self.shm = device, B, shm_tensor
+        self.in_px = shm_tensor.shape[1]
         self.output = output
         self.stream = torch.cuda.Stream()
         self.cap_stream = torch.cuda.Stream()
@@ -283,7 +314,7 @@ class GraphGen:
             def gen_fn(b, c):
                 f, ch0, ch1, cnt = fr(b, c)
                 return bk(ch0.double(), ch1.double(), _curvature(curv, f.double() if self.fp32 else f), cnt)
-        s_bgr = torch.zeros((self.B, EXTENDED_PX, EXTENDED_PX, 3), dtype=torch.uint8, device=self.device)
+        s_bgr = torch.zeros((self.B, self.in_px, self.in_px, 3), dtype=torch.uint8, device=self.device)
         s_bgr[..., 2] = 1   # 有効な適当値 (x = 65536) でウォームアップ
         s_cs = torch.full((self.B,), 1.0, dtype=DT, device=self.device)
         torch.cuda.synchronize()

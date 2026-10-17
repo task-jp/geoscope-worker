@@ -52,6 +52,6 @@ def resolve_detection(d: dict, tx: int, ty: int, z: int = 16) -> dict | None:
         "lat": lat, "lon": lon, "conf": d["conf"],
         "bbox_cx": local_cx, "bbox_cy": local_cy,
         "bbox_w": w, "bbox_h": h,
-        "tile_x": real_tx, "tile_y": real_ty,
+        "tile_x": real_tx, "tile_y": real_ty, "tile_z": z,
         "cls": d.get("cls", 0),
     }

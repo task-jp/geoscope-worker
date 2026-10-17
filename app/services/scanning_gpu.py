@@ -36,7 +36,7 @@ import numpy as np
 import torch
 
 from app.core.dem import TILE_PX, dem_deps, pixel_to_latlon
-from app.core.gpu3ch import EXTENDED_PX, NAN_BGR, SLOT_BYTES, GraphGen, infer_yolo_collect, infer_yolo_launch, ksize_for
+from app.core.gpu3ch import EXTENDED_PX, NAN_BGR, SLOT_BYTES, GraphGen, slot_px, infer_yolo_collect, infer_yolo_launch, ksize_for
 from app.core.visualization import cell_size_m
 from app.services.detections import resolve_detection
 
@@ -50,7 +50,7 @@ def gpu_scan_available(model_type: str, z: int) -> bool:
     """この実装を使える条件。外れたら scan_tiles が従来経路で処理する。"""
     if os.environ.get("GPU_3CH", "1").lower() in ("0", "false", "no"):
         return False
-    return model_type == "yolo" and z == 16 and torch.cuda.is_available()
+    return model_type == "yolo" and z in (15, 16) and torch.cuda.is_available()
 
 
 def prepare_direct_model(model, conf_threshold: float, device, progress=None):
@@ -211,11 +211,57 @@ def _invalid_mask(bgr: np.ndarray) -> np.ndarray:
     return (bgr[:, :, 2] == 128) & (bgr[:, :, 1] == 0) & (bgr[:, :, 0] == 0)
 
 
-def build_canvas(read_bgr, tiles_dir: str, tx: int, ty: int, bgr: np.ndarray):
+def _main_valid_px(read_bgr, tiles_dir: str, z: int, tx: int, ty: int) -> int:
+    """本体タイル (z の 512 角) の有効画素数。_gen_3ch_uncached の「本体の有効画素 30% 未満は生成しない」用。
+    z15 は z16 の子 2×2 枚を 2×2 平均した画素で数える (4 画素のどれかが有効なら有効。dem.load_dem_z と同じ)。
+    本体が 1 枚も無ければ -1。"""
+    if z == 16:
+        main = read_bgr(str(Path(tiles_dir) / "16" / str(tx) / f"{ty}.webp"))
+        if main is None:
+            return -1
+        return main.shape[0] * main.shape[1] - int(np.count_nonzero(_invalid_mask(main)))
+    # 子ごとに 2×2 ブロックの有効を数えて足す (子の境界と 2×2 ブロックの境界は揃っている)
+    n = 0
+    found = False
+    for j in (0, 1):
+        for i in (0, 1):
+            child = read_bgr(str(Path(tiles_dir) / "16" / str(2 * tx + i) / f"{2 * ty + j}.webp"))
+            if child is None:
+                continue
+            found = True
+            inv = _invalid_mask(child).reshape(HALF, 2, HALF, 2)
+            n += HALF * HALF - int(np.count_nonzero(inv.all(axis=(1, 3))))
+    return n if found else -1
+
+
+def _build_canvas15(read_bgr, tiles_dir: str, tx: int, ty: int, bgr: np.ndarray):
+    """z15 の 768 角 canvas の元になる z16 の 3×3 枚 (1536 角) の生バイトを bgr に書く。
+    z15 canvas の画素 (r, c) は z16 canvas の 2×2 ブロック (2r..2r+1, 2c..2c+1) の平均 (GPU で行う)。
+    右・下・右下の z15 タイルから使うのは左半分・上半分・左上 1/4 で、それぞれ z16 の 1 列・1 行・1 枚に当たる。
+    _gen_3ch_uncached (z=15) は隣接 z15 を load_dem_z で作り、子が無い所は NaN になるので、
+    「z16 のファイルがあれば貼る、無ければ無効」と同じ。"""
+    for j in range(3):
+        for i in range(3):
+            t = read_bgr(str(Path(tiles_dir) / "16" / str(2 * tx + i) / f"{2 * ty + j}.webp"))
+            dst = bgr[j * TILE_PX:(j + 1) * TILE_PX, i * TILE_PX:(i + 1) * TILE_PX]
+            if t is None:
+                dst[:] = NAN_BGR
+            else:
+                dst[:] = t
+    lat, _ = pixel_to_latlon(15, tx, ty, EXTENDED_PX / 2, EXTENDED_PX / 2)
+    cs = cell_size_m(lat, 15)
+    return cs, ksize_for(cs)
+
+
+def build_canvas(read_bgr, tiles_dir: str, tx: int, ty: int, bgr: np.ndarray, z: int = 16):
     """DEM 4 枚の生バイトを 768x768x3 の bgr (共有メモリのスロット) に書く。戻り値 (cs, ksize) か None。
     None の判定は本体タイルの有効画素 30% 未満だけ。canvas 全体の有効画素と NaN 埋めの平均は GPU 側
     (gpu3ch.gpu_decode_fill / back) で行う。復号プロセスは標高に変換しない (倍精度配列の往復が
-    32 プロセスでメモリ帯域を食い潰し、復号が律速になっていた)。"""
+    32 プロセスでメモリ帯域を食い潰し、復号が律速になっていた)。z=15 は 1536 角の bgr に z16 を 3×3 枚置く。"""
+    if z == 15:
+        if _main_valid_px(read_bgr, tiles_dir, 15, tx, ty) < TILE_PX * TILE_PX * 0.3:
+            return None
+        return _build_canvas15(read_bgr, tiles_dir, tx, ty, bgr)
     main = read_bgr(str(Path(tiles_dir) / "16" / str(tx) / f"{ty}.webp"))
     if main is None:
         return None
@@ -236,43 +282,59 @@ def build_canvas(read_bgr, tiles_dir: str, tx: int, ty: int, bgr: np.ndarray):
     return cs, ksize_for(cs)
 
 
-def _attach_shm(name: str, slots: int) -> np.ndarray:
+def _attach_shm(name: str, slots: int, px: int = EXTENDED_PX) -> np.ndarray:
     """/dev/shm/<name> を直接 mmap する。SharedMemory(name=) だと resource_tracker に登録され、
-    終了時に二重 unregister で KeyError を吐くので使わない。"""
+    終了時に二重 unregister で KeyError を吐くので使わない。px はスロットの一辺 (z16 768、z15 1536)。"""
     import mmap
     fd = os.open(f"/dev/shm/{name}", os.O_RDWR)
     try:
-        m = mmap.mmap(fd, slots * SLOT_BYTES, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        m = mmap.mmap(fd, slots * px * px * 3, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
     finally:
         os.close(fd)
-    return np.ndarray((slots, EXTENDED_PX, EXTENDED_PX, 3), np.uint8, buffer=m)
+    return np.ndarray((slots, px, px, 3), np.uint8, buffer=m)
 
 
-def decode_worker(tiles_dir: str, shm_name: str, slots: int, task_q, free_q, res_q, lru: int) -> None:
+def decode_worker(tiles_dir: str, shm_name: str, slots: int, task_q, free_q, res_q, lru: int, z: int = 16) -> None:
     """task_q: (window_idx, task_id, [(tx, [ty, ...]), ...]) を順に処理し、res_q にタイルごとの結果を流す。
     結果: (slot, cs, ksize, tx, ty, window_idx, task_id) か (None, tx, ty, window_idx, task_id)。None で終了。
     1 タスクは隣接する数列。同じプロセスが隣の列を続けて処理するので、右隣の列の DEM が LRU に残る。"""
-    view = _attach_shm(shm_name, slots)
+    view = _attach_shm(shm_name, slots, slot_px(z))
     read_bgr = _make_reader(lru)
     while True:
         task = task_q.get()
         if task is None:
             break
         widx, tid, cols = task
-        for tx, tys in cols:
-            for ty in tys:
-                main = read_bgr(str(Path(tiles_dir) / "16" / str(tx) / f"{ty}.webp"))
-                if main is None or main.shape[0] * main.shape[1] - int(np.count_nonzero(_invalid_mask(main))) < TILE_PX * TILE_PX * 0.3:
+        for tx, ty in _task_order(cols, z):
+                if _main_valid_px(read_bgr, tiles_dir, z, tx, ty) < TILE_PX * TILE_PX * 0.3:
                     res_q.put((None, tx, ty, widx, tid))
                     continue
                 slot = free_q.get()
-                r = build_canvas(read_bgr, tiles_dir, tx, ty, view[slot])
+                r = build_canvas(read_bgr, tiles_dir, tx, ty, view[slot], z)
                 if r is None:
                     free_q.put(slot)
                     res_q.put((None, tx, ty, widx, tid))
                 else:
                     res_q.put((slot, r[0], r[1], tx, ty, widx, tid))
     res_q.put(("done",))
+
+
+def _task_order(cols: list[tuple[int, list[int]]], z: int):
+    """タスク (隣接する数列) の中を回る順。z16 は列順 (右隣の列の DEM が LRU に残る)。
+    z15 は行順: 1 枚に z16 を 3×3 枚使うので、列順だと列の長さぶん (数百行 × 3 枚) を LRU に持たないと
+    右隣の列で読み直しになる (実測 5.7 回/枚)。行順なら直前の行の z16 だけを再利用すればよい。"""
+    if z == 16:
+        for tx, tys in cols:
+            for ty in tys:
+                yield tx, ty
+        return
+    rows: dict[int, list[int]] = {}
+    for tx, tys in cols:
+        for ty in tys:
+            rows.setdefault(ty, []).append(tx)
+    for ty in sorted(rows):
+        for tx in sorted(rows[ty]):
+            yield tx, ty
 
 
 def _group_by_column(tiles: list[tuple[int, int]]) -> list[tuple[int, list[int]]]:
@@ -282,14 +344,16 @@ def _group_by_column(tiles: list[tuple[int, int]]) -> list[tuple[int, list[int]]
     return [(tx, sorted(by[tx])) for tx in sorted(by)]
 
 
-def _slot_count(requested: int) -> int:
-    """/dev/shm の空きに収まるスロット数。--shm-size=2g なら約 1,000 枚分。"""
+def _shm_bytes(requested_slots: int) -> int:
+    """共有メモリの大きさ。z16 のスロット (768 角) requested_slots 枚分を上限に、/dev/shm の空きの 8 割まで。
+    --shm-size=2g なら約 1,000 枚分。z15 は同じ領域を 1536 角のスロットとして使う (約 1/4 の枚数)。"""
+    want = requested_slots * SLOT_BYTES
     try:
         st = os.statvfs("/dev/shm")
-        avail = st.f_bavail * st.f_frsize
-        return max(2 * GEN_BATCH, min(requested, int(avail * 0.8 // SLOT_BYTES)))
+        want = min(want, int(st.f_bavail * st.f_frsize * 0.8))
     except OSError:
-        return requested
+        pass
+    return max(want, 2 * GEN_BATCH * slot_px(15) ** 2 * 3)
 
 
 # ---------------------------------------------------------------- 本体
@@ -331,7 +395,7 @@ def scan_tiles_gpu(
 
     torch.set_num_threads(4)   # 主プロセスの CPU 演算は僅か。既定 (コア数) だと OMP のスピンが復号プロセスの CPU を奪う
     ctx = mp.get_context("forkserver")
-    slots = _slot_count(int(os.environ.get("GPU_3CH_SLOTS", "1024")))
+    px = slot_px(z)
     procs: list = []
     feeder: threading.Thread | None = None
     stop = threading.Event()
@@ -341,28 +405,38 @@ def scan_tiles_gpu(
     # scan_tiles を呼ぶので、毎回作ると起動に 5 秒かかるうえ、TensorRT と併用すると GPU メモリが積み上がって
     # 2 チャンク目で OOM になった (実測)
     pst = _PERSIST
-    if pst.get("slots") != slots:
+    # 大きさは最初に 1 回だけ決める。2 回目以降に /dev/shm の空きから計算し直すと、自分が確保した分だけ
+    # 空きが減って見えて「大きさが変わった」と判断し、作り直してしまう (そのときはピン止めが TensorRT の後になる)
+    nbytes = pst.get("bytes") or _shm_bytes(int(os.environ.get("GPU_3CH_SLOTS", "1024")))
+    if pst.get("bytes") != nbytes:
         _release_persistent()
-        shm = shared_memory.SharedMemory(create=True, size=slots * SLOT_BYTES)
-        view = np.ndarray((slots, EXTENDED_PX, EXTENDED_PX, 3), np.uint8, buffer=shm.buf)
-        shm_t = torch.from_numpy(view)
+        shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        raw = torch.from_numpy(np.ndarray((nbytes,), np.uint8, buffer=shm.buf))
         # 共有メモリをピン止め (DMA 可能に) する。失敗すると H2D が同期コピーになり、生成バッチが 12 → 33 ms に
-        # 落ちる (実測)。GPU メモリをたくさん使った後 (TensorRT のコンテキスト等) だと失敗することがあるので、
-        # TensorRT の初期化より先に行う
-        rc = int(torch.cuda.cudart().cudaHostRegister(shm_t.data_ptr(), shm_t.numel(), 0))
+        # 落ちる (実測)。GPU メモリをたくさん使った後 (TensorRT のコンテキスト等) だと失敗するので、
+        # TensorRT の初期化より先に 1 回だけ行う。z16 と z15 はこの同じ領域を別のスロット寸法で使う
+        # (ズームごとに作り直すと、2 回目は TensorRT の後になってピン止めに失敗する)
+        rc = int(torch.cuda.cudart().cudaHostRegister(raw.data_ptr(), raw.numel(), 0))
         if rc != 0:
             print(f"[scanning_gpu] cudaHostRegister failed (rc={rc}); host→GPU copies will be slow", flush=True)
-        pst.update(slots=slots, shm=shm, shm_t=shm_t, registered=rc == 0, gen=None)
-    shm, shm_t = pst["shm"], pst["shm_t"]
+        pst.update(bytes=nbytes, shm=shm, raw=raw, registered=rc == 0, gens={})
+    shm = pst["shm"]
+    slots = nbytes // (px * px * 3)
+    shm_t = pst["raw"][:slots * px * px * 3].view(slots, px, px, 3)
     try:
         if os.environ.get("GPU_INFER_TRT", "1") != "0":
             trt = _try_tensorrt(model, device, progress_callback)
             if trt is not None:
                 net = trt
                 batch_size = TRT_BATCH   # engine の固定バッチに合わせる (リングもこの値で作る)
-        if pst.get("gen") is None:
-            pst["gen"] = GraphGen(device, GEN_BATCH, shm_t, compiled=os.environ.get("GPU_3CH_COMPILE", "1") != "0", output="infer")
-        gen = pst["gen"]
+        gens = pst["gens"]
+        if z not in gens:
+            # 別ズームの Graph は手放す (z16 と z15 を同時に持つと GPU メモリが足りない。1 ジョブで切り替えるのは 1 回)
+            for other in list(gens):
+                del gens[other]
+            torch.cuda.empty_cache()
+            gens[z] = GraphGen(device, GEN_BATCH, shm_t, compiled=os.environ.get("GPU_3CH_COMPILE", "1") != "0", output="infer")
+        gen = gens[z]
         # 推論入力のリング 2 面 (生成が片方に書いている間にもう片方を推論する)。channels_last は畳み込みが速い
         ring_cap = batch_size + GEN_BATCH
         mf = torch.channels_last if os.environ.get("GPU_INFER_CHANNELS_LAST", "1") != "0" else torch.contiguous_format
@@ -371,7 +445,7 @@ def scan_tiles_gpu(
         ring_i, ring_pos = 0, 0
         # 推論は専用ストリームで。既定ストリームだと TensorRT が enqueueV3 のたびに cudaStreamSynchronize を足す (警告が出る)
         inf_stream = torch.cuda.Stream()
-        ksizes = {ksize_for(cell_size_m(pixel_to_latlon(16, tx, ty, EXTENDED_PX / 2, EXTENDED_PX / 2)[0], 16))
+        ksizes = {ksize_for(cell_size_m(pixel_to_latlon(z, tx, ty, EXTENDED_PX / 2, EXTENDED_PX / 2)[0], z))
                   for tx, ty in todo}
         gen.prebuild(ksizes)
         if progress_callback:
@@ -383,7 +457,7 @@ def scan_tiles_gpu(
         for i in range(slots):
             free_q.put(i)
         for _ in range(num_workers):
-            p = ctx.Process(target=decode_worker, args=(tiles_dir, shm.name, slots, task_q, free_q, res_q, LRU_TILES),
+            p = ctx.Process(target=decode_worker, args=(tiles_dir, shm.name, slots, task_q, free_q, res_q, LRU_TILES, z),
                             daemon=True)
             p.start()
             procs.append(p)
@@ -630,7 +704,7 @@ def _release_persistent() -> None:
         return
     try:
         if pst.get("registered"):
-            torch.cuda.cudart().cudaHostUnregister(pst["shm_t"].data_ptr())
+            torch.cuda.cudart().cudaHostUnregister(pst["raw"].data_ptr())
     except Exception:
         pass
     try:

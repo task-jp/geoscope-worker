@@ -439,6 +439,17 @@ class JobAlreadyDone(Exception):
     pass
 
 
+def _job_zs(config: dict | None) -> tuple[int, ...]:
+    """ジョブがスキャンするズーム。新しい config は tile_zs (例 [16, 15] = 標準+広域を 1 回で)、
+    古い config は tile_z だけ。z16 を先に回す (細かいほうが本命で、z15 はその盲点の補完)。"""
+    config = config or {}
+    zs = config.get("tile_zs") or [config.get("tile_z", 16)]
+    zs = tuple(sorted({int(z) for z in zs}, reverse=True))
+    if not zs or any(z not in (15, 16) for z in zs):
+        raise ValueError(f"unsupported tile_zs: {zs}")
+    return zs
+
+
 class _AsyncProgress:
     """進捗の送信をスキャンのスレッドから外す。送信は 1 本のスレッドで行い、溜まった分は最新の値だけ送る。
 
@@ -1227,15 +1238,15 @@ def _drain_queued_scans() -> tuple[list[dict], list[dict]]:
             seen.add(pid)
             unique.append(job)
 
-    # ズーム混在排除: 1 バッチは 1 回のスキャンパスなので z を揃える。
-    # 先頭ジョブの z に合わせ、異なる z のジョブは次バッチに回す。
+    # ズーム混在排除: 1 バッチは同じタイル列を全員で回すので、スキャンするズームの組を揃える。
+    # 先頭ジョブの組に合わせ、異なる組のジョブは次バッチに回す。
     if unique:
-        batch_z = (unique[0].get("config") or {}).get("tile_z", 16)
+        batch_z = _job_zs(unique[0].get("config"))
         same_z = []
         for job in unique:
-            jz = (job.get("config") or {}).get("tile_z", 16)
+            jz = _job_zs(job.get("config"))
             if jz != batch_z:
-                print(f"  tile_z={jz} differs from batch z={batch_z}, requeueing job {job['id']}")
+                print(f"  tile_zs={jz} differs from batch zs={batch_z}, requeueing job {job['id']}")
                 _requeue_job(job["id"])
             else:
                 same_z.append(job)
@@ -1318,8 +1329,8 @@ def _prepare_scan_batch(scan_jobs: list[dict]) -> tuple[dict, list, list, list]:
             "conf_threshold": config.get("conf_threshold", 0.3),
             "job_ids": [j["id"] for j in jobs],
             "scanned_tiles": config.get("scanned_tiles", 0),
-            # バッチ内の z は _drain_queued_scans で揃えてある
-            "tile_z": config.get("tile_z", 16),
+            # バッチ内のズームの組は _drain_queued_scans で揃えてある
+            "tile_zs": _job_zs(config),
         }
 
     all_job_ids = []
@@ -1590,62 +1601,63 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
     # を対象にする。以前は combined_tile_set=None でフォールバックし、結果的に
     # ローカル cache 内のタイルしか走らない「偽物の全国」になっていた。
     update_all(0.30, "スキャン準備中...")
-    # バッチ内の z は _drain_queued_scans で揃えてある (既定 16、z=15 は広域モード)
-    z_scan = next(iter(class_map.values())).get("tile_z", 16) if class_map else 16
-    combined_tile_set: set[tuple[int, int]] = set()
-    needs_japan_all = False
-    for info in class_map.values():
-        pref = info["prefecture"]
-        if not pref:
-            needs_japan_all = True
-            break  # 全国は都道府県の上位集合
-        try:
-            tiles_data = api_get(f"/api/prefectures/{requests.utils.quote(pref)}/tiles?z={z_scan}")
-            if tiles_data:
-                combined_tile_set |= {(t["x"], t["y"]) for t in tiles_data}
-        except Exception as e:
-            print(f"  Failed to get tiles for {pref}: {e}")
+    # バッチ内のズームの組は _drain_queued_scans で揃えてある (既定 (16,)、広域は (15,)、標準+広域は (16, 15))
+    zs = next(iter(class_map.values()))["tile_zs"] if class_map else (16,)
+    needs_japan_all = any(not info["prefecture"] for info in class_map.values())
+    mode_label = "全国" if needs_japan_all else "+".join(
+        sorted({(info.get("prefecture") or "?") for info in class_map.values()})
+    )
 
-    if needs_japan_all:
-        try:
-            import struct as _struct
-            resp = requests.get(f"{SERVER_URL}/tiles/list/{z_scan}",
-                                headers=_headers(), timeout=120, verify=_VERIFY_SSL)
-            resp.raise_for_status()
-            data = resp.content
-            combined_tile_set = {
-                _struct.unpack_from("<HH", data, i) for i in range(0, len(data), 4)
-            }
-            print(f"  全国 mode: {len(combined_tile_set):,} tiles from /tiles/list/{z_scan}")
-        except Exception as e:
-            print(f"  Failed to get Japan-wide tile list: {e}")
-            combined_tile_set = set()  # 空 set: 下流で空チェックされ no-op
+    def _target_tiles(z: int) -> set[tuple[int, int]]:
+        """ズーム z のスキャン対象 (全プロジェクトの和集合)。prefecture=None (= 全国) のジョブが
+        1 つでもあれば /tiles/list/{z} を引いてサーバー実在の全 land タイルを対象にする。以前は
+        None でフォールバックし、ローカル cache 内のタイルしか走らない「偽物の全国」になっていた。"""
+        tile_set: set[tuple[int, int]] = set()
+        if needs_japan_all:
+            try:
+                import struct as _struct
+                resp = requests.get(f"{SERVER_URL}/tiles/list/{z}",
+                                    headers=_headers(), timeout=120, verify=_VERIFY_SSL)
+                resp.raise_for_status()
+                data = resp.content
+                tile_set = {_struct.unpack_from("<HH", data, i) for i in range(0, len(data), 4)}
+                print(f"  全国 mode: {len(tile_set):,} tiles from /tiles/list/{z}")
+            except Exception as e:
+                print(f"  Failed to get Japan-wide tile list (z={z}): {e}")
+            return tile_set
+        for info in class_map.values():
+            try:
+                tiles_data = api_get(f"/api/prefectures/{requests.utils.quote(info['prefecture'])}/tiles?z={z}")
+                if tiles_data:
+                    tile_set |= {(t["x"], t["y"]) for t in tiles_data}
+            except Exception as e:
+                print(f"  Failed to get tiles for {info['prefecture']} (z={z}): {e}")
+        return tile_set
 
     # ─────────────────────────────────────────────────────────────
     # 配布物ラベル ↔ 実スキャン範囲の乖離を fail-loud で潰す仕組み。
     # 過去に「全国」UI で起動した scan が裏で教師近辺の数万件しか走らず、
     # 月単位で気付かれずに biased な検出結果を蓄積していた。再発防止として、
     # 名乗っている mode に対し最小タイル数を assert し、満たさなければ
-    # その場で job を fail させる。
-    # 数字の根拠: z=16 の日本本土 land タイルは約 107 万件 (CLAUDE.md / tiles.list)。
+    # その場で job を fail させる。ズームごとに確かめる。
+    # 数字の根拠: z=16 の日本本土 land タイルは約 120 万件 (tiles.list)。
     # ネット瞬断 / R2 ダウンで部分取得になっても 80 万切ったら確実に異常。
-    # ─────────────────────────────────────────────────────────────
-    # z=15 は z16 の親タイル (最大 1/4、実測では海岸線の畳み込みでやや多め) なので
+    # z=15 は z16 の親タイル (最大 1/4、実測では海岸線の畳み込みでやや多め、約 32 万) なので
     # floor も 1/4 に落とす
-    SCAN_TILE_FLOOR_JAPAN = 800_000 if z_scan == 16 else 200_000
-    n_target = len(combined_tile_set)
-    mode_label = "全国" if needs_japan_all else "+".join(
-        sorted({(info.get("prefecture") or "?") for info in class_map.values()})
-    )
-    floor = SCAN_TILE_FLOOR_JAPAN if needs_japan_all else 1
-    status = "OK" if n_target >= floor else "VIOLATION"
-    print(f"[scan-coverage] mode={mode_label} n_tiles={n_target:,} floor={floor:,} status={status}")
-    if status == "VIOLATION":
-        raise RuntimeError(
-            f"scan coverage violation: mode={mode_label} に対し対象タイルが "
-            f"{n_target:,} 件しかない (floor={floor:,})。fake-全国 縮退の "
-            f"再発と判断し、biased な結果を生む前にジョブを fail させます。"
-        )
+    # ─────────────────────────────────────────────────────────────
+    target_sets: dict[int, set[tuple[int, int]]] = {}
+    for z in zs:
+        tile_set = _target_tiles(z)
+        floor = (800_000 if z == 16 else 200_000) if needs_japan_all else 1
+        status = "OK" if len(tile_set) >= floor else "VIOLATION"
+        print(f"[scan-coverage] mode={mode_label} z={z} n_tiles={len(tile_set):,} floor={floor:,} status={status}")
+        if status == "VIOLATION":
+            raise RuntimeError(
+                f"scan coverage violation: mode={mode_label} z={z} に対し対象タイルが "
+                f"{len(tile_set):,} 件しかない (floor={floor:,})。fake-全国 縮退の "
+                f"再発と判断し、biased な結果を生む前にジョブを fail させます。"
+            )
+        target_sets[z] = tile_set
 
     min_conf = min(info["conf_threshold"] for info in class_map.values())
     upload_counts = defaultdict(int)
@@ -1653,7 +1665,7 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
     def det_to_annotation(d: dict, scan_label: str) -> dict:
         score = d["conf"]
         import math as _math
-        z, tx, ty = z_scan, d["tile_x"], d["tile_y"]
+        z, tx, ty = d["tile_z"], d["tile_x"], d["tile_y"]
         cx, cy, w, h = d["bbox_cx"], d["bbox_cy"], d["bbox_w"], d["bbox_h"]
         n = 2 ** z
         lon_west = (tx + (cx - w/2) / 512) / n * 360 - 180
@@ -1736,21 +1748,53 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
             except Exception:
                 pass
 
-    # タイル列挙してparallel configを設定（スタンドアロンワーカーが参加可能にする）
-    if combined_tile_set:
-        # 都道府県等で範囲が決まっている場合は集合から直接生成する。
-        # _enumerate_tiles はローカルファイル列挙にフォールバックする経路があり、
-        # SKIP_DEM_EXTRACT=true の Pod ではローカルにタイルがほぼ無いため
-        # 正しい範囲が得られない (2/2 tiles 空成功問題)。
-        all_tiles = [
-            (str(Path(TILES_DIR) / str(z_scan) / str(tx) / f"{ty}.webp"), tx, ty)
-            for tx, ty in combined_tile_set
-        ]
-    else:
-        from app.services.scanning import _enumerate_tiles
-        all_tiles = _enumerate_tiles(TILES_DIR, None, fetch_tile if REMOTE_TILES else None,
-                                     z=z_scan)
+    # タイル列。ズームごとに作って z16 → z15 の順に繋げる。claim-tiles のカーソルはこの通し番号を進める。
+    # all_tiles[i] は (path, tx, ty)、all_z[i] はそのズーム
+    pos_by_z: dict[int, set[tuple[int, int]]] = {}
+    for z in zs:
+        pos = set()
+        for _pid, annots in (project_annotations or []):
+            for a in annots:
+                if a.get("annotation_vote") == "yes" and a.get("tile_x") is not None:
+                    # アノテーションのタイル座標をスキャン z に変換 (z16 → z15 は >>1)
+                    shift = (a.get("tile_z") or 16) - z
+                    if shift >= 0:   # スキャン z より粗い座標は近傍ソートに使わない
+                        pos.add((a["tile_x"] >> shift, a["tile_y"] >> shift))
+        pos_by_z[z] = pos
+
+    all_tiles: list[tuple[str, int, int]] = []
+    all_z: list[int] = []
+    for z in zs:
+        if target_sets[z]:
+            # 都道府県等で範囲が決まっている場合は集合から直接生成する。
+            # _enumerate_tiles はローカルファイル列挙にフォールバックする経路があり、
+            # SKIP_DEM_EXTRACT=true の Pod ではローカルにタイルがほぼ無いため
+            # 正しい範囲が得られない (2/2 tiles 空成功問題)。
+            tiles_z = [(str(Path(TILES_DIR) / str(z) / str(tx) / f"{ty}.webp"), tx, ty)
+                       for tx, ty in sorted(target_sets[z])]
+        else:
+            from app.services.scanning import _enumerate_tiles
+            tiles_z = _enumerate_tiles(TILES_DIR, None, fetch_tile if REMOTE_TILES else None, z=z)
+        # ⭕タイルに近い順にソート（有望エリアを先にスキャン）
+        if pos_by_z[z] and tiles_z:
+            import numpy as np
+            from scipy.spatial import cKDTree
+            pos_arr = np.array(list(pos_by_z[z]), dtype=np.int32)
+            tile_coords = np.array([(tx, ty) for _, tx, ty in tiles_z], dtype=np.int32)
+            # 各タイルから最近接⭕タイルまでの距離を k-d tree で一括計算。
+            # 旧コードは (chunk × pos) の int32 broadcasting を 17 チャンク回しており、
+            # py-spy で「Pre-fetch 完了後に 25 分以上 1533 行で張り付く」病的な
+            # スローダウンが実測された。cKDTree は 1.07M × 3k 程度なら秒未満で抜ける。
+            min_dists, _ = cKDTree(pos_arr).query(tile_coords)
+            order = np.argsort(min_dists, kind="stable")
+            tiles_z = [tiles_z[j] for j in order]
+            print(f"  z={z}: {len(tiles_z):,} tiles (sorted by proximity to {len(pos_by_z[z])} ⭕ tiles)")
+        else:
+            print(f"  z={z}: {len(tiles_z):,} tiles")
+        all_tiles += tiles_z
+        all_z += [z] * len(tiles_z)
     total_tiles = len(all_tiles)
+    print(f"  Total tiles: {total_tiles:,} (zooms {'+'.join(map(str, zs))})")
 
     # スキャン範囲のタイル全部 + 拡張タイル用隣接を prefetch (R2 並列で高速取得)
     if REMOTE_TILES and total_tiles > 0:
@@ -1758,41 +1802,11 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
         # DEM の実体は z16 のみ。z=15 は子タイルを合成するので prefetch も z16 座標
         from app.core.dem import dem_deps
         scan_tiles_needed: set[tuple[int, int, int]] = set()
-        for _path, tx, ty in all_tiles:
+        for (_path, tx, ty), z in zip(all_tiles, all_z):
             for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                for cx, cy in dem_deps(z_scan, tx + dx, ty + dy):
+                for cx, cy in dem_deps(z, tx + dx, ty + dy):
                     scan_tiles_needed.add((16, cx, cy))
         _prefetch_tiles(scan_tiles_needed, label="scan-range DEM tiles")
-
-    # ⭕タイルに近い順にソート（有望エリアを先にスキャン）
-    if project_annotations:
-        pos_tiles = set()
-        for _pid, annots in project_annotations:
-            for a in annots:
-                if a.get("annotation_vote") == "yes" and a.get("tile_x") is not None:
-                    # アノテーションのタイル座標をスキャン z に変換 (z16 → z15 は >>1)
-                    a_z = a.get("tile_z") or 16
-                    shift = a_z - z_scan
-                    if shift < 0:
-                        continue  # スキャン z より粗い座標は近傍ソートに使わない
-                    pos_tiles.add((a["tile_x"] >> shift, a["tile_y"] >> shift))
-        if pos_tiles:
-            import numpy as np
-            from scipy.spatial import cKDTree
-            pos_arr = np.array(list(pos_tiles), dtype=np.int32)
-            tile_coords = np.array([(tx, ty) for _, tx, ty in all_tiles], dtype=np.int32)
-            # 各タイルから最近接⭕タイルまでの距離を k-d tree で一括計算。
-            # 旧コードは (chunk × pos) の int32 broadcasting を 17 チャンク回しており、
-            # py-spy で「Pre-fetch 完了後に 25 分以上 1533 行で張り付く」病的な
-            # スローダウンが実測された。cKDTree は 1.07M × 3k 程度なら秒未満で抜ける。
-            min_dists, _ = cKDTree(pos_arr).query(tile_coords)
-            order = np.argsort(min_dists)
-            all_tiles = [all_tiles[j] for j in order]
-            print(f"  Total tiles: {total_tiles:,} (sorted by proximity to {len(pos_tiles)} ⭕ tiles)")
-        else:
-            print(f"  Total tiles: {total_tiles:,}")
-    else:
-        print(f"  Total tiles: {total_tiles:,}")
 
     # モデルをサーバーにアップロード（スタンドアロンワーカーがダウンロードできるように）
     for info in class_map.values():
@@ -1831,27 +1845,38 @@ def _scan_multi(model_path, class_map, job_ids, project_annotations=None):
 
             start_idx = chunks[0]["start"]
             count = chunks[0]["count"]
-            _chunk_start[0] = start_idx
-            _chunk_count[0] = count
             my_tiles = all_tiles[start_idx:start_idx + count]
 
             if not my_tiles:
                 print(f"  Warning: empty tile slice [{start_idx}:{start_idx+count}] (all_tiles={len(all_tiles)}), skipping chunk")
                 continue
 
-            scan_tiles(
-                model_path=model_path,
-                tiles_dir=TILES_DIR,
-                conf_threshold=min_conf,
-                batch_size=128,
-                num_workers=32,
-                progress_callback=on_progress,
-                detection_callback=on_detections,
-                tile_fetcher=fetch_tile if REMOTE_TILES else None,
-                tile_list=my_tiles,
-                cancel_event=_cancel_event,
-                z=z_scan,
-            )
+            # チャンクが z16 と z15 の境目をまたぐことがあるので、同じズームの区間ごとに scan_tiles を呼ぶ
+            run_start = start_idx
+            end_idx = start_idx + len(my_tiles)
+            while run_start < end_idx:
+                z = all_z[run_start]
+                run_end = run_start
+                while run_end < end_idx and all_z[run_end] == z:
+                    run_end += 1
+                _chunk_start[0] = run_start
+                _chunk_count[0] = run_end - run_start
+                scan_tiles(
+                    model_path=model_path,
+                    tiles_dir=TILES_DIR,
+                    conf_threshold=min_conf,
+                    batch_size=128,
+                    num_workers=32,
+                    progress_callback=on_progress,
+                    detection_callback=on_detections,
+                    tile_fetcher=fetch_tile if REMOTE_TILES else None,
+                    tile_list=all_tiles[run_start:run_end],
+                    cancel_event=_cancel_event,
+                    z=z,
+                )
+                if _cancel_event.is_set():
+                    break
+                run_start = run_end
     finally:
         progress.close()
     _flush_uploads()

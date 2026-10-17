@@ -7,6 +7,7 @@ GPU が無い環境では GPU のテストはスキップし、純粋な Python/
 import math
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 import torch
@@ -148,3 +149,63 @@ def test_tensorrt_matches_eager(tmp_path):
     # 乱数画像でも検出 (低 conf) が出る。箱の数とおおよその conf が一致すること
     na, nb = sum(len(x) for x in a), sum(len(x) for x in b)
     assert abs(na - nb) <= max(2, na // 10)
+
+
+def test_pool2_nanmean_matches_load_dem_z():
+    """z15 の 2×2 縮約が dem.load_dem_z (np.nanmean) と同じ値になる (CPU の torch で確認)。"""
+    rng = np.random.default_rng(3)
+    e = np.round(rng.normal(100, 30, (2, 8, 12)), 2)
+    e[0, :2, :2] = np.nan          # 4 画素とも無効 → 無効
+    e[1, 2, 2] = np.nan            # 1 画素だけ無効 → 残り 3 画素の平均
+    t = torch.from_numpy(np.nan_to_num(e))
+    got, inv = gpu3ch._pool2_nanmean(t, torch.from_numpy(np.isnan(e)))
+    blocks = e.reshape(2, 4, 2, 6, 2).swapaxes(2, 3).reshape(2, 4, 6, 4)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)   # 全部 NaN のブロック ("Mean of empty slice")
+        ref = np.nanmean(blocks, axis=3)
+    assert np.array_equal(inv.numpy(), np.isnan(ref))
+    assert np.array_equal(got.numpy()[~np.isnan(ref)], ref[~np.isnan(ref)])
+
+
+def test_task_order_z15_is_row_major():
+    cols = [(4, [1, 2]), (5, [2, 3])]
+    assert list(scanning_gpu._task_order(cols, 16)) == [(4, 1), (4, 2), (5, 2), (5, 3)]
+    # z15 は行順: 行 1 → 行 2 (列 4, 5) → 行 3
+    assert list(scanning_gpu._task_order(cols, 15)) == [(4, 1), (4, 2), (5, 2), (5, 3)]
+    cols2 = [(4, [1, 3]), (5, [1, 2])]
+    assert list(scanning_gpu._task_order(cols2, 15)) == [(4, 1), (5, 1), (5, 2), (4, 3)]
+
+
+def _write_dem_tile(root: Path, x: int, y: int, elev: np.ndarray) -> None:
+    d = root / "16" / str(x)
+    d.mkdir(parents=True, exist_ok=True)
+    assert cv2.imwrite(str(d / f"{y}.webp"), _encode_bgr(elev), [cv2.IMWRITE_WEBP_QUALITY, 101])   # 101 = 可逆
+
+
+@cuda
+def test_z15_gpu_matches_cpu_pixels(tmp_path, monkeypatch):
+    """z15: z16 の 3×3 枚を GPU で 2×2 平均して作る 3ch が、CPU 経路 (_gen_3ch_uncached z=15) と同じ画素になる。
+    一部の z16 は欠損させ、NaN も混ぜる。"""
+    from app.services.scanning import _gen_3ch_uncached
+    monkeypatch.setattr(gpu3ch, "PRECISION", "fp64")
+    tx, ty = 29000, 12900                      # z15 (z16 の 58000..58002 × 25800..25802)
+    big = _synthetic_dem(7, size=1536)
+    for j in range(3):
+        for i in range(3):
+            if (i, j) == (2, 1):
+                continue                       # 欠損タイル
+            _write_dem_tile(tmp_path, 2 * tx + i, 2 * ty + j, big[j * 512:(j + 1) * 512, i * 512:(i + 1) * 512])
+    ref = _gen_3ch_uncached((str(tmp_path), tx, ty, 15))
+    assert ref is not None
+    dev = torch.device("cuda")
+    px = gpu3ch.slot_px(15)
+    shm = torch.zeros((2, px, px, 3), dtype=torch.uint8).pin_memory()
+    r = scanning_gpu.build_canvas(scanning_gpu._make_reader(64), str(tmp_path), tx, ty, shm[0].numpy(), 15)
+    assert r is not None
+    gen = gpu3ch.GraphGen(dev, 2, shm, compiled=False, output="uint8")
+    imgs, keep, _, _ = gen([(0, r[0], r[1])])
+    torch.cuda.synchronize()
+    assert bool(keep[0])
+    diff = np.abs(imgs[0].cpu().numpy().astype(np.int16) - ref[0].astype(np.int16))
+    assert diff.max() <= 1 and np.count_nonzero(diff) <= 3
